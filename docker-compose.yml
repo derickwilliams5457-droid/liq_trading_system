@@ -1,0 +1,41 @@
+version: "3.9"
+
+# Three long-running services sharing one volume (./data) so they can pass
+# data through the CSV / JSONL files exactly like they do when run locally
+# in separate VS Code terminals. Bring the whole pipeline up with:
+#     docker compose up -d
+# Watch one service's logs with:
+#     docker compose logs -f bot
+# Tear down: docker compose down
+
+services:
+  liq_stream:
+    build: .
+    command: python liq_stream.py
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
+
+  liq_bucket:
+    build: .
+    command: python liq_bucket.py
+    restart: unless-stopped
+    depends_on:
+      - liq_stream
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
+
+  bot:
+    build: .
+    command: python run_bot.py
+    restart: unless-stopped
+    depends_on:
+      - liq_bucket
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env

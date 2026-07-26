@@ -1,0 +1,14 @@
+{
+  "python.envFile": "${workspaceFolder}/.env",
+  "python.analysis.typeCheckingMode": "basic",
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.pyc": true
+  },
+  "files.watcherExclude": {
+    "**/data/**": true
+  },
+  "search.exclude": {
+    "**/data/**": true
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "1: liq_stream",
+      "type": "shell",
+      "command": "${command:python.interpreterPath}",
+      "args": ["liq_stream.py"],
+      "isBackground": true,
+      "presentation": { "panel": "dedicated", "group": "pipeline" },
+      "problemMatcher": []
+    },
+    {
+      "label": "2: liq_bucket",
+      "type": "shell",
+      "command": "${command:python.interpreterPath}",
+      "args": ["liq_bucket.py"],
+      "isBackground": true,
+      "presentation": { "panel": "dedicated", "group": "pipeline" },
+      "problemMatcher": []
+    },
+    {
+      "label": "3: run_bot",
+      "type": "shell",
+      "command": "${command:python.interpreterPath}",
+      "args": ["run_bot.py"],
+      "isBackground": true,
+      "presentation": { "panel": "dedicated", "group": "pipeline" },
+      "problemMatcher": []
+    },
+    {
+      "label": "performance_plot",
+      "type": "shell",
+      "command": "${command:python.interpreterPath}",
+      "args": ["performance_plot.py"],
+      "presentation": { "panel": "dedicated" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Start Pipeline (all 3 stages)",
+      "dependsOn": ["1: liq_stream", "2: liq_bucket", "3: run_bot"],
+      "dependsOrder": "parallel",
+      "problemMatcher": []
+    }
+  ]
+}

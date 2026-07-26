@@ -1,0 +1,50 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    
+    {
+      "name": "liq_stream.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/liq_stream.py",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "liq_bucket.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/liq_bucket.py",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "run_bot.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_bot.py",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "strategy.py (standalone test)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/strategy.py",
+      "args": ["BTCUSDT"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "anomaly.py (standalone test)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/anomaly.py",
+      "args": ["XAUTUSDT"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "performance_plot.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/performance_plot.py",
+      "console": "integratedTerminal"
+    }
+  ]
+}
