@@ -7,5 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# each service overrides this with its own `command:` in docker-compose.yml
-CMD ["python", "run_bot.py"]
+# default: run all three pipeline stages in this one container (Railway-style
+# single-service hosts). For docker-compose's multi-container setup, each
+# service overrides this with its own `command:`.
+CMD ["python", "entrypoint.py"]
+
