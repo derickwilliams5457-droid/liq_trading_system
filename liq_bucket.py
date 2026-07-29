@@ -61,13 +61,14 @@ def load_events() -> pd.DataFrame:
     return df
 
 
-def emit_signal(f_out, symbol: str, bucket_start: datetime, signal: str, count: int, prior_streak: int):
+def emit_signal(f_out, symbol: str, bucket_start: datetime, signal: str, count: int, prior_streak: int, usd):
     record = {
         "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "bucket_start": bucket_start.isoformat(),
         "symbol": symbol,
         "signal": signal,
         "count_in_bucket": int(count),
+        "usd_in_bucket": round(float(usd), 2),
         "prior_streak": int(prior_streak),
     }
     f_out.write(json.dumps(record) + "\n")
@@ -102,19 +103,21 @@ def process_tick(df: pd.DataFrame, state: dict, f_out) -> dict:
 
         while cursor < now_bucket:
             count = int(counts.get((sym, cursor), 0))
-            is_active = count > 0
+            usd_sums = df.groupby(['symbol', 'bucket'])['usd_value'].sum().to_dict()
+            usd = float(usd_sums.get((sym, cursor), 0.0))
+            is_active = usd >= config.MIN_ACTIVITY_USD
             signal = None
 
             if is_active:
                 if silent >= config.SILENCE_THRESHOLD:
                     signal = "activity_spike"
-                    emit_signal(f_out, sym, cursor, signal, count, silent)
+                    emit_signal(f_out, sym, cursor, signal, count, silent, usd)
                 active += 1
                 silent = 0
             else:
                 if active >= config.ACTIVITY_THRESHOLD:
                     signal = "collapse"
-                    emit_signal(f_out, sym, cursor, signal, count, active)
+                    emit_signal(f_out, sym, cursor, signal, count, active, usd)
                 silent += 1
                 active = 0
 
@@ -132,18 +135,39 @@ def process_tick(df: pd.DataFrame, state: dict, f_out) -> dict:
 def main():
     print(f"\n  Liquidation Bucket Monitor")
     print(f"  Bucket width      : {config.BUCKET_MINUTES}min")
+    print(f"  Active bucket min : ${config.MIN_ACTIVITY_USD:,.0f} total liquidation volume")
     print(f"  Silence threshold : {config.SILENCE_THRESHOLD} buckets -> activity_spike")
     print(f"  Activity threshold: {config.ACTIVITY_THRESHOLD} buckets -> collapse")
     print(f"  Reading           : {config.LIQ_CSV}")
     print(f"  Writing signals to: {config.LIQ_SIGNALS_FILE}\n")
 
     state = load_state()
+    tick_count = 0
+    heartbeat_every = max(1, round(60 / config.BUCKET_POLL_SECONDS))
 
     with open(config.LIQ_SIGNALS_FILE, "a") as f_out:
         while True:
             df = load_events()
+            n_events = len(df) if not df.empty else 0
             state = process_tick(df, state, f_out)
             save_state(state)
+            tick_count += 1
+            time.sleep(config.BUCKET_POLL_SECONDS)
+
+            if tick_count % heartbeat_every == 0:
+                now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                n_symbols = len(state)
+                closest = sorted(
+                    state.items(),
+                    key=lambda kv: -max(kv[1].get("silent", 0), kv[1].get("active", 0)),
+                )[:3]
+                closest_str = ", ".join(
+                    f"{sym}(silent={s.get('silent', 0)},active={s.get('active', 0)})"
+                    for sym, s in closest
+                )or "none yet"
+                print(f" [{now}] heartbeat: {n_events} rows in CSV, {n_symbols} symbols tracked, ")
+                print(f"closest to firing : {closest_str}")
+
             time.sleep(config.BUCKET_POLL_SECONDS)
 
 

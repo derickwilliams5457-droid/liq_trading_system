@@ -21,6 +21,7 @@ import csv
 import json
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import ccxt
 
@@ -51,8 +52,19 @@ class Trader:
 
     # ── Position state ───────────────────────────────────────────────────
     def get_open_positions(self):
-        positions = self.exchange.fetch_positions()
-        return [p for p in positions if float(p.get("contracts") or p.get("info", {}).get("positionAmt", 0)) != 0]
+        try:
+            positions = self.exchange.fetch_positions()
+            return [
+                p for p in positions 
+                if float(p.get("contracts") or p.get("info", {}).get("positionAmt", 0)) != 0
+            ]
+        except (ccxt.RequestTimeout, ccxt.NetworkError) as e:
+            print(f"  [trader] Network error fetching positions: {e}")
+            # Return empty or handle gracefully depending on safety requirements
+            return []
+        except Exception as e:
+            print(f"  [trader] Unexpected error fetching positions: {e}")
+            return []
 
     def has_open_position(self) -> bool:
         return len(self.get_open_positions()) >= config.MAX_CONCURRENT_POSITIONS
@@ -73,15 +85,28 @@ class Trader:
             return qty
 
     # ── Execution ────────────────────────────────────────────────────────
-    def execute_trade(self, levels: dict):
-        """levels is allocation.compute_levels()'s return dict."""
+    def execute_trade(self, levels: dict, deadline_ts: float | None = None):
+        """levels is allocation.compute_levels()'s return dict.
+
+        deadline_ts: Optional Unix timestamp cutoff. Trade aborts if current time exceeds this.
+        """
+        # 1. Deadline Check: Prevent executing stale signals
+        if deadline_ts is not None and time.time() > deadline_ts:
+            print(
+                f"  [trader] Aborting {levels.get('symbol', 'trade')} — signal deadline expired "
+                f"({time.time() - deadline_ts:.2f}s late)."
+            )
+            return None
+
         if self.has_open_position():
             print(f"  [trader] Skipping {levels['symbol']} — a position is already open.")
             return None
 
         if levels.get("risk_reward") is None or levels["risk_reward"] < config.MIN_RISK_REWARD:
-            print(f"  [trader] Skipping {levels['symbol']} — R:R {levels.get('risk_reward')} "
-                  f"below MIN_RISK_REWARD ({config.MIN_RISK_REWARD}).")
+            print(
+                f"  [trader] Skipping {levels['symbol']} — R:R {levels.get('risk_reward')} "
+                f"below MIN_RISK_REWARD ({config.MIN_RISK_REWARD})."
+            )
             return None
 
         symbol = levels["symbol"]
@@ -95,6 +120,11 @@ class Trader:
         qty = self._position_size(symbol, entry_hint, sl)
         if qty <= 0:
             print(f"  [trader] Zero/invalid position size for {symbol}, skipping.")
+            return None
+
+        # 2. Re-check deadline right before API order placement
+        if deadline_ts is not None and time.time() > deadline_ts:
+            print(f"  [trader] Aborting {symbol} right before order placement — deadline exceeded.")
             return None
 
         try:
@@ -117,22 +147,31 @@ class Trader:
             self._log_trade_event({"event": "order_failed", "error": str(e), **levels})
             return None
 
-        self._open_trade_meta = {**levels, "qty": qty, "opened_at": datetime.now(timezone.utc).isoformat()}
+        self._open_trade_meta = {
+            **levels, 
+            "qty": qty, 
+            "opened_at": datetime.now(timezone.utc).isoformat()
+        }
         self._log_trade_event({"event": "opened", **self._open_trade_meta})
         print(f"  [trader] Opened {direction.upper()} {symbol} qty={qty} entry~{entry_hint} sl={sl} tp={tp}")
         return entry_order
 
     # ── Monitoring / performance logging ────────────────────────────────
     def _init_performance_csv(self):
-        if not config.PERFORMANCE_CSV.exists():
-            with open(config.PERFORMANCE_CSV, "w", newline="") as f:
+        csv_path = Path(config.PERFORMANCE_CSV)
+        # Ensure target directory exists before opening file
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not csv_path.exists():
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f, quoting=csv.QUOTE_MINIMAL).writerow([
                     "timestamp_utc", "symbol", "direction", "qty", "entry",
                     "sl", "tp", "mark_price", "unrealized_pnl", "status",
                 ])
 
     def _log_performance_row(self, symbol, direction, qty, entry, sl, tp, mark_price, pnl, status):
-        with open(config.PERFORMANCE_CSV, "a", newline="") as f:
+        csv_path = Path(config.PERFORMANCE_CSV)
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
             csv.writer(f, quoting=csv.QUOTE_MINIMAL).writerow([
                 datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 symbol, direction, qty, entry, sl, tp, mark_price, pnl, status,
@@ -140,7 +179,9 @@ class Trader:
 
     def _log_trade_event(self, record: dict):
         record["time"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        with open(config.TRADE_LOG_FILE, "a") as f:
+        log_path = Path(config.TRADE_LOG_FILE)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, default=str) + "\n")
 
     def monitor_loop(self):

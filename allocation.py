@@ -1,18 +1,22 @@
 """
-allocation.py  —  Stage 4 of the pipeline
-===========================================
-Given a direction from strategy.py, computes the stop-loss and take-profit.
+allocation.py  —  Stage 4 of the pipeline (rectangle-based)
+=============================================================
+Given a direction + rect_info from strategy.py, computes SL and TP using the
+rectangle framework:
 
-TP: the nearest uncleared anomaly zone in the direction of the bet (above
-    price for a long, below price for a short) — price only needs to touch
-    the near edge of the zone, so that edge is the TP trigger. If no zone
-    exists on that side, fall back to an ATR multiple.
+  TP candidates:
+    - VWAP of the 6-candle rectangle window
+    - ATR-based extension (entry ± ATR_TP_MULT_RECT * ATR)
+    Only candidates inside the rectangle are considered; the one with the
+    best R:R is chosen.
 
-SL: the nearest uncleared zone on the OPPOSITE side of price. A zone closer
-    than config.MIN_SL_ZONE_ATR_MULT * ATR is too tight to be a usable stop,
-    so it's ignored. If no usable opposite-side zone exists at all, fall back
-    to the high/low of the previous config.PREV_TREND_CANDLES candles,
-    pushed out by an ATR buffer.
+  SL:
+    - If the interest candle DID NOT create the rectangle extreme (high for
+      shorts, low for longs): SL = rect extreme ± SL_BUFFER_POINTS
+    - If the interest candle DID create the extreme: SL = entry ±
+      ATR_SL_MULT_RECT * ATR (3min-ATR-based)
+
+  Minimum R:R of config.MIN_RR (1.0) is enforced.
 """
 
 import pandas as pd
@@ -21,85 +25,118 @@ import config
 
 
 def atr(candles: pd.DataFrame, period: int = None) -> float:
-    """Classic Wilder ATR from OHLC candles (needs high/low/close columns)."""
+    """Classic Wilder ATR from OHLC candles."""
     period = period or config.ATR_PERIOD
     high, low, close = candles["high"], candles["low"], candles["close"]
     prev_close = close.shift(1)
-
     tr = pd.concat([
         high - low,
         (high - prev_close).abs(),
         (low - prev_close).abs(),
     ], axis=1).max(axis=1)
-
     n = min(period, len(tr.dropna()))
     if n == 0:
         return float(tr.iloc[-1]) if len(tr) else 0.0
     return float(tr.tail(n).mean())
 
 
-def _nearest_zone(zones: list[dict], price: float, side: str) -> dict | None:
-    """side='above' -> zones with mid > price, side='below' -> zones with mid < price.
-    Returns the zone whose near edge is closest to price, or None."""
-    candidates = [z for z in zones if (z["mid"] > price if side == "above" else z["mid"] < price)]
-    if not candidates:
-        return None
-    if side == "above":
-        return min(candidates, key=lambda z: z["low"] - price)
-    return min(candidates, key=lambda z: price - z["high"])
+def _vwap(candles: pd.DataFrame) -> float:
+    """VWAP over the given candle set."""
+    typical = (candles["high"] + candles["low"] + candles["close"]) / 3
+    vol = candles["volume"]
+    if vol.sum() == 0:
+        return float(candles["close"].mean())
+    return float((typical * vol).sum() / vol.sum())
 
 
 def compute_levels(symbol: str, direction: str, price: float, candles: pd.DataFrame,
-                    zones: list[dict], prev_trend_candles: pd.DataFrame = None) -> dict:
+                    zones: list[dict], prev_trend_candles: pd.DataFrame = None,
+                    rect_info: dict = None) -> dict:
     """
     direction: 'long' or 'short'
-    candles: recent OHLC candles (used for ATR); should include at least
-             config.ATR_PERIOD + 1 bars for a real ATR — pad the fetch in
-             run_bot.py if needed.
-    zones: output of anomaly.get_uncleared_zones()
-    prev_trend_candles: the config.PREV_TREND_CANDLES candles before the
-             signal, used only as the SL fallback. Defaults to `candles`.
+    candles: OHLC DataFrame (used for ATR; tail(6) used for VWAP)
+    rect_info: output of strategy.decide_direction() — rectangle bounds and
+               interest-candle extremity flags.
     """
-    prev_trend_candles = prev_trend_candles if prev_trend_candles is not None else candles
     atr_value = atr(candles)
 
-    tp_side = "above" if direction == "long" else "below"
-
-    tp_zone = _nearest_zone(zones, price, tp_side)
-
-    # SL: only consider opposite-side zones that clear the minimum distance —
-    # a too-tight nearest zone shouldn't block a further-out usable one.
-    def sl_edge_dist(z):
-        edge = z["high"] if direction == "long" else z["low"]
-        return abs(price - edge)
-
-    sl_candidates = [z for z in zones if (z["mid"] < price if direction == "long" else z["mid"] > price)]
-    sl_candidates = [z for z in sl_candidates if sl_edge_dist(z) >= config.MIN_SL_ZONE_ATR_MULT * atr_value]
-    sl_zone = min(sl_candidates, key=sl_edge_dist) if sl_candidates else None
-
-    # ── Take profit ──────────────────────────────────────────────────────
-    if tp_zone:
-        tp_price = tp_zone["low"] if direction == "long" else tp_zone["high"]
-        tp_method = "uncleared_zone"
-    else:
-        tp_price = (price + config.ATR_TP_FALLBACK_MULT * atr_value if direction == "long"
-                    else price - config.ATR_TP_FALLBACK_MULT * atr_value)
-        tp_method = "atr_fallback"
-
     # ── Stop loss ────────────────────────────────────────────────────────
-    if sl_zone:
-        sl_price = sl_zone["high"] if direction == "long" else sl_zone["low"]
-        sl_method = "uncleared_zone"
-    else:
-        trend_low = prev_trend_candles["low"].min()
-        trend_high = prev_trend_candles["high"].max()
-        buffer = config.ATR_SL_FALLBACK_MULT * atr_value
-        sl_price = (trend_low - buffer) if direction == "long" else (trend_high + buffer)
-        sl_method = "atr_trend_fallback"
+    if rect_info is None:
+        return {
+            "symbol": symbol, "direction": direction, "entry": price,
+            "atr": round(atr_value, 6), "sl": None, "tp": None,
+            "sl_method": "no_rect_info", "tp_method": "no_rect_info",
+            "risk_reward": None,
+        }
 
-    risk = abs(price - sl_price)
-    reward = abs(tp_price - price)
-    rr = round(reward / risk, 2) if risk > 0 else None
+    rect_high = rect_info["rect_high"]
+    rect_low = rect_info["rect_low"]
+
+    if direction == "short":
+        if not rect_info["interest_created_high"]:
+            sl_price = rect_high + config.SL_BUFFER_POINTS
+            sl_method = "rect_buffer"
+        else:
+            sl_price = price + config.ATR_SL_MULT_RECT * atr_value
+            sl_method = "rect_atr"
+    else:
+        if not rect_info["interest_created_low"]:
+            sl_price = rect_low - config.SL_BUFFER_POINTS
+            sl_method = "rect_buffer"
+        else:
+            sl_price = price - config.ATR_SL_MULT_RECT * atr_value
+            sl_method = "rect_atr"
+
+    # ── Take profit candidates ───────────────────────────────────────────
+    window = candles.tail(config.RECTANGLE_CANDLES) if len(candles) >= config.RECTANGLE_CANDLES else candles
+    vwap_price = _vwap(window)
+
+    if direction == "short":
+        atr_tp = price - config.ATR_TP_MULT_RECT * atr_value
+        candidates = []
+        if vwap_price < price and vwap_price >= rect_low:
+            candidates.append(("vwap", vwap_price))
+        if atr_tp < price and atr_tp >= rect_low:
+            candidates.append(("atr", atr_tp))
+    else:
+        atr_tp = price + config.ATR_TP_MULT_RECT * atr_value
+        candidates = []
+        if vwap_price > price and vwap_price <= rect_high:
+            candidates.append(("vwap", vwap_price))
+        if atr_tp > price and atr_tp <= rect_high:
+            candidates.append(("atr", atr_tp))
+
+    if not candidates:
+        print(f"  [allocation] {symbol}: no valid TP inside rectangle, skipping.")
+        return {
+            "symbol": symbol, "direction": direction, "entry": price,
+            "atr": round(atr_value, 6), "sl": round(sl_price, 6),
+            "tp": None, "sl_method": sl_method, "tp_method": "none_inside_rect",
+            "risk_reward": None,
+        }
+
+    # Pick the candidate with the best R:R
+    best_rr = -1
+    best_tp = None
+    best_method = None
+    for method, tp_candidate in candidates:
+        risk = abs(price - sl_price)
+        reward = abs(tp_candidate - price)
+        rr = reward / risk if risk > 0 else 0
+        if rr > best_rr:
+            best_rr = rr
+            best_tp = tp_candidate
+            best_method = method
+
+    # ── Enforce minimum R:R ──────────────────────────────────────────────
+    if best_rr < config.MIN_RR:
+        print(f"  [allocation] {symbol}: best R:R {best_rr:.2f} < {config.MIN_RR}, skipping.")
+        return {
+            "symbol": symbol, "direction": direction, "entry": price,
+            "atr": round(atr_value, 6), "sl": round(sl_price, 6),
+            "tp": round(best_tp, 6), "sl_method": sl_method, "tp_method": best_method,
+            "risk_reward": round(best_rr, 2),
+        }
 
     return {
         "symbol": symbol,
@@ -107,8 +144,8 @@ def compute_levels(symbol: str, direction: str, price: float, candles: pd.DataFr
         "entry": price,
         "atr": round(atr_value, 6),
         "sl": round(sl_price, 6),
-        "tp": round(tp_price, 6),
+        "tp": round(best_tp, 6),
         "sl_method": sl_method,
-        "tp_method": tp_method,
-        "risk_reward": rr,
+        "tp_method": best_method,
+        "risk_reward": round(best_rr, 2),
     }

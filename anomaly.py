@@ -21,6 +21,8 @@ import pandas as pd
 import ccxt
 from scipy import stats
 
+import config
+
 
 def _normalize_pandas_freq(tf: str) -> str:
     """Accepts either a ccxt/Binance-style timeframe ('3m', '15m', '1h', '1d')
@@ -156,10 +158,94 @@ def compute_uncleared_zones(df: pd.DataFrame, use_relative: bool = True, clearin
     return zones
 
 
+def detect_anomalies_in_window(candles: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detect anomaly candles within a candle window. Uses a z-score on candle
+    range (high - low). Any candle whose range is > 1 std above the mean
+    range is flagged as anomalous.
+
+    Returns the FULL DataFrame with 'intensity', 'is_anomaly', and
+    'is_anomaly_relative' columns added, so compute_uncleared_zones() can
+    use all candles for clearing detection.
+    """
+    if candles is None or candles.empty or len(candles) < 3:
+        return pd.DataFrame()
+
+    df = candles.copy()
+    col_map = {}
+    for lower, upper in [("time", "Time"), ("open", "Open"), ("high", "High"),
+                          ("low", "Low"), ("close", "Close"), ("volume", "Volume")]:
+        if upper not in df.columns and lower in df.columns:
+            col_map[lower] = upper
+    if col_map:
+        df = df.rename(columns=col_map)
+    if "Volume" not in df.columns:
+        df["Volume"] = 0
+
+    ranges = df["High"] - df["Low"]
+    mean_r = ranges.mean()
+    std_r = ranges.std()
+    if std_r == 0 or mean_r == 0:
+        return pd.DataFrame()
+
+    # Body-to-range ratio as additional signal
+    bodies = abs(df["Close"] - df["Open"])
+    body_ratio = bodies / ranges.where(ranges > 0, 1)
+    range_z = (ranges - mean_r) / std_r
+
+    df["intensity"] = range_z.clip(0) * 0.6 + body_ratio.clip(0) * 0.4
+    df["is_anomaly"] = (range_z > 1.0) | (body_ratio > 0.7)
+    df["is_anomaly_relative"] = df["intensity"] > df["intensity"].quantile(0.8)
+
+    return df
+
+
 def get_uncleared_zones(symbol: str, chart_tf: str = "3min", fetch_mode: str = "today",
-                          use_relative: bool = True, clearing: str = "close") -> list[dict]:
-    """Convenience one-shot: fetch + compute in a single call. This is the
-    function allocation.py imports."""
+                          use_relative: bool = True, clearing: str = "close",
+                          candles: pd.DataFrame = None,
+                          rect_high: float = None, rect_low: float = None) -> list[dict]:
+    """Fetch + compute uncleared zones.
+
+    If *candles* is provided, anomaly detection runs on those candles instead
+    of fetching fresh data. This is used by the rectangle strategy which
+    already has the relevant 6-candle window.
+
+    If *rect_high* and *rect_low* are provided, anomalies are detected ONLY
+    on the rectangle window (last config.RECTANGLE_CANDLES candles), never
+    from candles outside it. The full candle set is still used for the
+    clearing check."""
+    if candles is not None and not candles.empty:
+        if rect_high is not None and rect_low is not None:
+            # Detect anomalies ONLY on the rectangle window
+            rect_window = candles.tail(config.RECTANGLE_CANDLES)
+            flagged_rect = detect_anomalies_in_window(rect_window)
+            if flagged_rect.empty:
+                return []
+            # Normalize full candle columns to uppercase
+            full = candles.copy()
+            if "Time" not in full.columns:
+                full = full.rename(columns={
+                    "time": "Time", "open": "Open", "high": "High",
+                    "low": "Low", "close": "Close", "volume": "Volume",
+                })
+            # Default all candles to non-anomaly
+            full["is_anomaly"] = False
+            full["is_anomaly_relative"] = False
+            full["intensity"] = 0.0
+            # Merge anomaly flags from rect window by matching Time
+            for _, r in flagged_rect.iterrows():
+                mask = full["Time"] == r["Time"]
+                if mask.any():
+                    full.loc[mask, "is_anomaly"] = True
+                    full.loc[mask, "is_anomaly_relative"] = r["is_anomaly_relative"]
+                    full.loc[mask, "intensity"] = r["intensity"]
+            return compute_uncleared_zones(full, use_relative=use_relative, clearing=clearing)
+        else:
+            flagged = detect_anomalies_in_window(candles)
+            if flagged.empty:
+                return []
+            return compute_uncleared_zones(flagged, use_relative=use_relative, clearing=clearing)
+
     analyzer = BinanceFuturesAnalyzer(symbol=symbol, chart_tf=chart_tf)
     df, _ = analyzer.fetch_anomaly_data(fetch_mode=fetch_mode)
     return compute_uncleared_zones(df, use_relative=use_relative, clearing=clearing)
