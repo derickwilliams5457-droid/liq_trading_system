@@ -40,9 +40,10 @@ BUCKET_MINUTES      = 3     # width of each time bucket
 SILENCE_THRESHOLD    = 5     # consecutive silent buckets -> next active bucket fires "activity_spike"
 ACTIVITY_THRESHOLD   = 5     # consecutive active buckets  -> next silent bucket fires "collapse"
 BUCKET_POLL_SECONDS  = 15    # how often liq_bucket.py re-scans the CSV for the current bucket
-TRIGGER_SIGNAL       = "activity_spike"   # which signal type the strategy engine acts on
-MIN_ACTIVITY_USD     = 1000  # a bucket only counts as "active" if its total liquidation $ >= this —
-                              # a bucket with liquidations under this stays "silent" for streak purposes
+TRIGGER_SIGNAL       = "activity_spike"   # which signal type the strategy engine acts on (post-close fallback)
+PRE_SPIKE_SIGNAL     = "pre_activity_spike"   # emitted 15s before candle close for pre-calculation
+MIN_ACTIVITY_USD     = 1000  # a bucket only counts as "active" if its LARGEST SINGLE liquidation >= this —
+                              # cumulative volume doesn't matter; ten $100 liqs adding to $1,000 stay "silent"
 
 # Two different notations for the same "3 minutes", used in different places:
 #   EXCHANGE_TIMEFRAME — Binance/ccxt notation ("3m") — for fetch_ohlcv() calls
@@ -84,29 +85,70 @@ MIN_VOTES_AGREE      = 2       # need at least 2 of the 3 votes agreeing to call
 
 # ── Timing — limit order priced at the interest candle's exact close ───────
 # T = the interest (silence/spike) candle's CLOSE time = bucket_start + BUCKET_MINUTES.
-# From T, there is ENTRY_TIMEOUT_SECONDS total to: compute all 3 votes (with
-# retries on fetch failure), compute allocation levels, place a LIMIT order at
-# that exact close price, and get it filled. The instant it fills, everything
-# stops. If the deadline (T + ENTRY_TIMEOUT_SECONDS) passes unfilled, the
-# order is cancelled and the trade is abandoned — no trade taken.
+#
+# FALLBACK flow (post-close, TRIGGER_SIGNAL): from T there is
+# ENTRY_TIMEOUT_SECONDS total to: compute all 3 votes (with retries on fetch
+# failure), compute allocation levels, place a LIMIT order at that exact close
+# price, and get it filled. The instant it fills, everything stops. If the
+# deadline passes unfilled, the order is cancelled and the trade is abandoned.
+#
+# PRE-CALC flow (PRE_SPIKE_SIGNAL): votes, SL and TP are computed BEFORE close
+# (while the interest candle is forming). At close only the actual close price
+# + R:R recompute + limit order placement remain, so the window into the new
+# candle is much tighter — PRE_CALC_EXECUTE_SECONDS. Once R:R passes, execute
+# immediately; never sit on the 60s budget.
 ENTRY_TIMEOUT_SECONDS   = 60
+PRE_CALC_EXECUTE_SECONDS = 10   # max seconds INTO the new candle to recompute R:R and fill the limit order
+PRE_CLOSE_SECONDS       = 15    # the pre-spike signal is designed to arrive ~15s before close
 ORDER_POLL_SECONDS      = 1     # how often to check fill status within that window
 
 # ── Rectangle strategy (strategy.py + allocation.py) ──────────────────────────
-RECTANGLE_CANDLES = 6           # 5 previous 3min candles + 1 interest candle
-SL_BUFFER_POINTS = 0.0005       # points buffer beyond rectangle high/low when interest candle didn't create the extreme
-ATR_SL_MULT_RECT = 1.5          # ATR multiplier for SL when interest candle created the extreme
-ATR_TP_MULT_RECT = 2.5          # ATR multiplier for TP candidate
+RECTANGLE_CANDLES = 5           # 5 previous 3min candles (interest candle excluded)
 MIN_RR = 1.0                    # minimum acceptable risk:reward (overrides MIN_RISK_REWARD for rectangle trades)
+
+# ── Localized Dynamic-ATR stop loss (strategy.py + allocation.py) ─────────────
+# The ONLY stop-loss logic in the system. SL distance = Dynamic ATR over the
+# 5+1 candle window: ATR = mean(TR), dynamic = ATR (MAD is computed/reported
+# for reference only and is no longer added). Applied as entry - dynamic
+# (long) / entry + dynamic (short).
+SL_ATR_WINDOW = RECTANGLE_CANDLES   # 5 previous candles (interest candle excluded)
 
 # ── Allocation / risk (allocation.py) ────────────────────────────────────────
 ANOMALY_CHART_TF        = EXCHANGE_TIMEFRAME   # ccxt notation — anomaly.py normalizes internally for resample
-ATR_PERIOD               = 14
 ATR_TP_FALLBACK_MULT     = 2.5   # TP distance in ATRs when no uncleared zone exists in the TP direction
-ATR_SL_FALLBACK_MULT     = 1.5   # SL buffer in ATRs added beyond the 6-candle trend high/low fallback
-MIN_SL_ZONE_ATR_MULT     = 0.5   # an opposite-side zone closer than this many ATRs is too tight to use as SL
-PREV_TREND_CANDLES       = 6     # "trend of the 6 candles before" used for the SL fallback
 MIN_RISK_REWARD          = 1.0   # trades below this R:R are skipped entirely — never executed
+
+# ── Performance / speculative precompute (run_bot.py + hratmap.py) ──────────
+# The 3m aggTrades window is fetched in slices (each slice < 1h is the Binance
+# limit for startTime+endTime together). Slices are fetched with a single
+# worker AND serialized by the global one-at-a-time lock in ratelimit.py, so
+# the bot always polls Binance strictly one request at a time.
+SLICE_MINUTES                = 6     # aggTrades slice size in minutes
+MAX_WORKERS                  = 1     # concurrent slice fetchers (serialized by the global rate limiter)
+# hratmap pulls aggTrades for the TP-zone window only — the prior 9 completed
+# candles (9 x 3m = 27min). Smaller than the full lookback, so the expensive
+# aggTrades pull finishes well inside the pre-close budget.
+HRATMAP_LOOKBACK_CANDLES     = 9
+# A symbol SILENCE_THRESHOLD+ silent buckets deep is one active bucket away
+# from firing "activity_spike" — keep its zone window warm in the background
+# so the trigger finds the slow aggTrades pull already done.
+WARM_SYMBOLS                 = 1     # how many on-deck symbols to precompute for
+WARM_POLL_SECONDS            = 15    # how often the warmer re-checks bucket state
+MAX_CONCURRENT_ZONE_FETCHES  = 1     # cap on simultaneous hratmap aggTrades pulls
+
+# ── Shared market-data cache (data_cache.py) ────────────────────────────────
+# Strategy's 3m candles and hratmap's zone-window candles are the SAME stream —
+# cached once (tag "klines:3m") and shared, so neither re-polls Binance for
+# data the other already fetched. run_bot.py also evicts the per-symbol
+# entries after each verdict; the TTL below is just a safety net.
+CANDLE_CACHE_TTL             = 300    # seconds a cached candle batch stays fresh
+
+# ── Global Binance rate limiting (ratelimit.py) ──────────────────────────────
+# Binance USD-M caps the whole IP at 2400 request-weight/min and 418-bans the
+# IP when exceeded. This token bucket is the single guard for every REST call
+# in the process — keep the cap comfortably below 2400 so we can never earn a
+# ban, no matter how many modules ask at once.
+RATE_LIMIT_WEIGHT_PER_MIN = 1800    # global budget: aggTrades=20, klines=2, exchangeInfo=1
 
 # ── Trader / execution (trader.py) ───────────────────────────────────────────
 SYMBOL_QUOTE           = "USDT"
@@ -114,7 +156,8 @@ TESTNET                = os.getenv("LIQ_TESTNET", "true").lower() == "true"   # 
 RISK_PER_TRADE_PCT     = float(os.getenv("LIQ_RISK_PCT", "0.5"))   # % of account equity risked per trade
 LEVERAGE                = int(os.getenv("LIQ_LEVERAGE", "5"))
 POSITION_POLL_SECONDS   = 5     # how often trader.py polls open-position PnL
-MAX_CONCURRENT_POSITIONS = 1     # "one position open at a time"
+POSITION_CLOSED_CONFIRM_POLLS = 2  # consecutive polls with no position before a trade is declared closed
+MAX_CONCURRENT_POSITIONS = 3     # multiple positions open at a time (multi-coin execution)
 
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
