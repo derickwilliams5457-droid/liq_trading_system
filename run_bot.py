@@ -44,6 +44,10 @@ import ratelimit
 import strategy
 from trader import Trader
 
+# The Bybit mirror is imported lazily in main() — if the package/creds are
+# missing the bot degrades to Binance-only instead of crashing at import time.
+from bybit_mirror import BybitMirror
+
 _zone_fetches: dict = {}  # (symbol, end_time_ms) -> {"thread", "symbol", "end_time", "tag", "result"}
 _ZONE_FETCH_LOCK = threading.Lock()
 
@@ -53,6 +57,30 @@ _ZONE_FETCH_LOCK = threading.Lock()
 #   "tp_zone" }
 _pending_pre_calcs: dict = {}
 _PENDING_LOCK = threading.Lock()
+
+
+def _all_exchanges_full(trader: Trader, mirror) -> bool:
+    """True iff EVERY enabled exchange is at its own concurrent-position cap.
+
+    Binance and Bybit are independent: each has its own MAX_CONCURRENT_* and
+    its own open-position count. A signal is only skipped here when NO exchange
+    can take it — e.g. Binance at 3/3 but Bybit at 2/3 still proceeds so the
+    mirror can open the trade on Bybit.
+
+    Raises ratelimit.BinanceBanned if Binance capacity can't be read because
+    the IP is banned — the caller sleeps the ban out (never poll into a ban).
+    A Bybit capacity-read error is NOT fatal: Bybit is treated as available and
+    its own execute_trade() will re-check before placing anything.
+    """
+    binance_full = trader is None or trader.has_open_position()
+    if mirror is None:
+        return binance_full
+    try:
+        bybit_full = mirror.has_open_position()
+    except Exception as e:
+        print(f"[run_bot] Bybit capacity check failed ({e}) — treating Bybit as available.")
+        bybit_full = False
+    return binance_full and bybit_full
 
 
 def _ensure_zone_fetch(symbol: str, end_time_ms: int, force: bool = True) -> dict | None:
@@ -133,7 +161,8 @@ def _warm_loop():
 
             on_deck = sorted(
                 ((sym, st.get("silent", 0)) for sym, st in state.items()
-                 if st.get("silent", 0) >= config.SILENCE_THRESHOLD),
+                 if config.is_traded_symbol(sym)
+                 and st.get("silent", 0) >= config.SILENCE_THRESHOLD),
                 key=lambda kv: -kv[1],
             )[:config.WARM_SYMBOLS]
 
@@ -144,7 +173,7 @@ def _warm_loop():
         time.sleep(config.WARM_POLL_SECONDS)
 
 
-def handle_pre_spike(trader: Trader, record: dict):
+def handle_pre_spike(trader: Trader, mirror, record: dict):
     """Handle a pre_activity_spike signal: pre-calculate SL/TP while the
     interest candle is still forming, store in pending_pre_calcs. R:R is NOT
     gated here — the entry price isn't known until close, so the only
@@ -183,11 +212,13 @@ def handle_pre_spike(trader: Trader, record: dict):
         time.sleep(banned_rem)
         return
 
-    # Position check — skip if at max concurrent positions
+    # Position check — skip only if EVERY enabled exchange is at max concurrent
+    # positions. Binance full + Bybit having slots still proceeds, so the
+    # mirror can take the trade on Bybit.
     try:
-        if trader.has_open_position():
-            print(f"[run_bot] Skipping {symbol} — at max concurrent positions.  "
-                  f"[pre-calc +{time.time() - t0:.1f}s]")
+        if _all_exchanges_full(trader, mirror):
+            print(f"[run_bot] Skipping {symbol} — all exchanges at max concurrent "
+                  f"positions.  [pre-calc +{time.time() - t0:.1f}s]")
             return
     except ratelimit.BinanceBanned as e:
         print(f"[run_bot] {symbol}: Binance IP ban detected ({e.remaining:.0f}s left) — "
@@ -333,7 +364,28 @@ def handle_pre_spike(trader: Trader, record: dict):
             _zone_fetches.pop((symbol, pre_close_end_ms), None)
 
 
-def _process_due_pendings(trader: Trader):
+def _dispatch(levels: dict, deadline_ts: float | None, wait_for_fill: bool,
+              trader: Trader, mirror):
+    """Execute a finalized trade across every enabled exchange. When the
+    Binance trader exists it dispatches internally to the attached mirror
+    (Trader.dispatch_trade); when Binance is not configured the mirror is
+    called directly. Every adapter re-checks its OWN capacity and symbol
+    listing before touching its exchange."""
+    if trader is not None:
+        try:
+            trader.dispatch_trade(levels, deadline_ts=deadline_ts, wait_for_fill=wait_for_fill)
+        except Exception as e:
+            print(f"[run_bot] {levels.get('symbol')}: trade execution failed ({e}), "
+                  f"skipping.  [verdict]")
+    elif mirror is not None:
+        try:
+            mirror.execute_trade(levels, deadline_ts=deadline_ts, wait_for_fill=wait_for_fill)
+        except Exception as e:
+            print(f"[run_bot] {levels.get('symbol')}: Bybit execution failed ({e}), "
+                  f"skipping.  [verdict]")
+
+
+def _process_due_pendings(trader: Trader, mirror):
     """Process EVERY pending pre-calc whose close time has arrived, inline and
     in priority order. Called at the top of the tail loop — so before any new
     signal for another coin is handled, all due pre-calculated coins are
@@ -352,6 +404,11 @@ def _process_due_pendings(trader: Trader):
     with _PENDING_LOCK:
         for key, pre in list(_pending_pre_calcs.items()):
             close_ts = pre["close_time"].timestamp()
+            # Allowlist gate (defense-in-depth): a stale pre-calc for a symbol
+            # outside the allowlist is dropped, never executed.
+            if not config.is_traded_symbol(pre["symbol"]):
+                _pending_pre_calcs.pop(key, None)
+                continue
             # Fetch the close price the exact second the candle opens.
             if now >= close_ts:
                 ready.append((key, pre))
@@ -443,10 +500,12 @@ def _process_due_pendings(trader: Trader):
               f"SL={sl}  TP={tp}  R:R={risk_reward}  "
               f"[verdict +{time.time() - t0:.1f}s]")
 
-        # Execute trade — place the order and move on immediately. Whether it
-        # fills or is rejected is owned by the entry follower in the background.
+        # Execute trade — place the order on Binance AND mirror it to Bybit
+        # (each exchange re-checks its own capacity/listing), then move on
+        # immediately. Whether it fills or is rejected is owned by each
+        # exchange's entry follower in the background.
         try:
-            trader.execute_trade(levels, deadline_ts=deadline, wait_for_fill=False)
+            _dispatch(levels, deadline, wait_for_fill=False, trader=trader, mirror=mirror)
         except ratelimit.BinanceBanned as e:
             print(f"[run_bot] {symbol}: pending close — Binance ban during execution "
                   f"({e.remaining:.0f}s) — trade not placed.  "
@@ -475,7 +534,7 @@ def _process_due_pendings(trader: Trader):
         time.sleep(1)  # check every second
 
 
-def handle_signal(trader: Trader, record: dict):
+def handle_signal(trader: Trader, mirror, record: dict):
     symbol = record["symbol"]
 
     t0 = time.time()  # internal clock: detection -> final verdict
@@ -503,14 +562,15 @@ def handle_signal(trader: Trader, record: dict):
         return
 
     try:
-        pos_open = trader.has_open_position()
+        blocked = _all_exchanges_full(trader, mirror)
     except ratelimit.BinanceBanned as e:
         print(f"[run_bot] {symbol}: Binance IP ban detected ({e.remaining:.0f}s left) — "
               f"sleeping it out, no polling.")
         time.sleep(max(e.remaining, 0.0))
         return
-    if pos_open:
-        print(f"[run_bot] Skipping {symbol} — a position is already open.  [verdict +{time.time() - t0:.1f}s]")
+    if blocked:
+        print(f"[run_bot] Skipping {symbol} — every enabled exchange is at max "
+              f"concurrent positions.  [verdict +{time.time() - t0:.1f}s]")
         return
 
     # ── Kick off the hratmap aggTrades pull in the BACKGROUND now, so the
@@ -614,7 +674,7 @@ def handle_signal(trader: Trader, record: dict):
             return
 
         try:
-            trader.execute_trade(levels, deadline_ts=deadline)
+            _dispatch(levels, deadline, wait_for_fill=True, trader=trader, mirror=mirror)
         except ratelimit.BinanceBanned as e:
             print(f"[run_bot] {symbol}: Binance IP ban during execution "
                   f"({e.remaining:.0f}s left) — trade not placed, sleeping the ban out.  "
@@ -635,7 +695,7 @@ def handle_signal(trader: Trader, record: dict):
         print(f"[run_bot] {symbol}: cache purged after verdict [tagged entries evicted].")
 
 
-def tail_signals(trader: Trader):
+def tail_signals(trader: Trader, mirror):
     """Follow config.LIQ_SIGNALS_FILE from its current end, like `tail -f`."""
     config.LIQ_SIGNALS_FILE.touch(exist_ok=True)
     last_heartbeat = time.time()
@@ -649,7 +709,7 @@ def tail_signals(trader: Trader):
             # coin is even looked at. Pending trades are never queued behind
             # new-coin work.
             try:
-                _process_due_pendings(trader)
+                _process_due_pendings(trader, mirror)
             except Exception as e:
                 print(f"[run_bot] pending-processing error: {e}")
                 traceback.print_exc()
@@ -673,11 +733,19 @@ def tail_signals(trader: Trader):
 
             seen_since_heartbeat += 1
             sig = record.get("signal")
+            # Allowlist gate: never run strategy/metrics for a symbol outside
+            # config.TRADED_SYMBOLS_FILE. This is defense-in-depth for stale
+            # signals already in the file or a bucket process running the old
+            # (pre-filter) code — the signal itself was dropped at the bucket
+            # level, but we don't rely on that here.
+            if not config.is_traded_symbol(record.get("symbol")):
+                print(f"[run_bot] ignoring {record.get('symbol')} — not in allowlist")
+                continue
             try:
                 if sig == config.PRE_SPIKE_SIGNAL:
-                    handle_pre_spike(trader, record)
+                    handle_pre_spike(trader, mirror, record)
                 elif sig == config.TRIGGER_SIGNAL:
-                    handle_signal(trader, record)
+                    handle_signal(trader, mirror, record)
                 else:
                     print(f"[run_bot] ignoring {record.get('symbol')} "
                           f"{sig} (unknown signal type)")
@@ -695,14 +763,33 @@ def main():
     print(f"  Fallback signal  : {config.TRIGGER_SIGNAL} (post-close)")
     print(f"  Strategy         : rectangle (extreme zones 0-20% / 80-100%, {config.RECTANGLE_CANDLES} candles)")
     print(f"  SL ATR window    : {config.SL_ATR_WINDOW} candles (interest excluded)")
-    print(f"  Max positions    : {config.MAX_CONCURRENT_POSITIONS}")
-    print(f"  Testnet          : {config.TESTNET}")
+    print(f"  Max positions    : {config.MAX_CONCURRENT_POSITIONS} (per exchange)")
+    print(f"  Binance testnet  : {config.TESTNET}")
     print(f"  Tailing          : {config.LIQ_SIGNALS_FILE}\n")
 
-    trader = Trader()
+    trader = None
+    try:
+        trader = Trader()
+    except Exception as e:
+        print(f"  Binance trader unavailable ({e}) — will trade on Bybit only if its mirror is up.")
 
-    monitor_thread = threading.Thread(target=trader.monitor_loop, daemon=True)
-    monitor_thread.start()
+    mirror = None
+    if config.BYBIT_ENABLED:
+        try:
+            mirror = BybitMirror()
+        except Exception as e:
+            print(f"  Bybit mirror unavailable ({e}) — continuing Binance-only.")
+
+    if trader is not None:
+        trader.mirror = mirror   # interconnect: Binance trades mirror to Bybit
+        monitor_thread = threading.Thread(target=trader.monitor_loop, daemon=True)
+        monitor_thread.start()
+    if mirror is not None:
+        mirror_thread = threading.Thread(target=mirror.monitor_loop, daemon=True)
+        mirror_thread.start()
+
+    if trader is None and mirror is None:
+        raise RuntimeError("No exchange adapter is configured (need Binance and/or Bybit keys).")
 
     warm_thread = threading.Thread(target=_warm_loop, daemon=True)
     warm_thread.start()
@@ -715,7 +802,7 @@ def main():
     print(f"  Pending closes    : processed inline with priority before new signals "
           f"(max {config.PRE_CALC_EXECUTE_SECONDS}s window into the new candle)")
 
-    tail_signals(trader)
+    tail_signals(trader, mirror)
 
 
 if __name__ == "__main__":

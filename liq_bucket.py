@@ -68,6 +68,15 @@ def load_events() -> pd.DataFrame:
         df["price"] = df["avg_price"]
     df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp_utc", "symbol"])
+
+    # ── Allowlist filter (bucket level). Only config.load_traded_symbols()
+    #    symbols survive, so run_bot.py never sees a signal — and never runs
+    #    strategy/metrics — for coins outside the list. None => file missing,
+    #    filter disabled.
+    allowed = config.load_traded_symbols()
+    if allowed is not None:
+        df = df[df["symbol"].isin(allowed)]
+
     df["bucket"] = df["timestamp_utc"].dt.floor(f"{config.BUCKET_MINUTES}min")
     return df
 
@@ -120,7 +129,21 @@ def process_tick(df: pd.DataFrame, state: dict, f_out) -> dict:
     now_bucket = pd.Timestamp.now(tz="UTC").floor(f"{config.BUCKET_MINUTES}min")
 
     if df.empty:
+        # Still drop stale allowlisted-out symbols from state (they linger in
+        # the JSON otherwise and run_bot's warmer reads that file directly).
+        if config.load_traded_symbols() is not None:
+            for sym in list(state.keys()):
+                if not config.is_traded_symbol(sym):
+                    del state[sym]
         return state
+
+    # Allowlist: drop symbols that are no longer allowed from persisted state,
+    # so the JSON never retains (or re-warms) non-allowlisted coins. The events
+    # DataFrame is already filtered in load_events(); this keeps state clean.
+    if config.load_traded_symbols() is not None:
+        for sym in list(state.keys()):
+            if not config.is_traded_symbol(sym):
+                del state[sym]
 
     # Precompute per (symbol, bucket) once: event count, total USD, and the
     # LARGEST SINGLE liquidation USD. "Active" is decided by the biggest
@@ -200,6 +223,32 @@ def process_tick(df: pd.DataFrame, state: dict, f_out) -> dict:
     return state
 
 
+_last_allowlist_snapshot: set | None = None   # last set object seen (None = disabled)
+
+
+def log_allowlist_change(allowed: set | None):
+    """Print a line the moment the allowlist changes on disk (config reloads
+    it on file mtime change). Identity-compares the cached set object, so this
+    only fires when the file was actually re-read and its contents changed."""
+    global _last_allowlist_snapshot
+    old = _last_allowlist_snapshot
+    if allowed is old:
+        return
+    if allowed is None:
+        print(f"  [allowlist] DISABLED — {config.TRADED_SYMBOLS_FILE} missing; every symbol passes")
+    elif old is None:
+        print(f"  [allowlist] enabled — {len(allowed)} symbols from {config.TRADED_SYMBOLS_FILE}")
+    elif allowed != old:
+        added = sorted(allowed - old)
+        removed = sorted(old - allowed)
+        print(f"  [allowlist] changed — {len(allowed)} symbols (added {len(added)}, removed {len(removed)})")
+        if added:
+            print(f"  [allowlist] added   : {', '.join(added[:15])}{' …' if len(added) > 15 else ''}")
+        if removed:
+            print(f"  [allowlist] removed : {', '.join(removed[:15])}{' …' if len(removed) > 15 else ''}")
+    _last_allowlist_snapshot = allowed
+
+
 def main():
     print(f"\n  Liquidation Bucket Monitor")
     print(f"  Bucket width      : {config.BUCKET_MINUTES}min")
@@ -208,15 +257,28 @@ def main():
     print(f"  Activity threshold: {config.ACTIVITY_THRESHOLD} buckets -> collapse")
     print(f"  Pre-spike         : immediate {config.PRE_SPIKE_SIGNAL} the moment ${config.MIN_ACTIVITY_USD:,.0f} "
           f"is crossed in a forming bucket (candle_closed=False)")
+    allowed = config.load_traded_symbols()
+    if allowed is None:
+        print(f"  Allowlist         : DISABLED ({config.TRADED_SYMBOLS_FILE} missing) — trading every symbol")
+    else:
+        print(f"  Allowlist         : {len(allowed)} symbols from {config.TRADED_SYMBOLS_FILE}")
     print(f"  Reading           : {config.LIQ_CSV}")
     print(f"  Writing signals to: {config.LIQ_SIGNALS_FILE}\n")
 
     state = load_state()
+    if allowed is not None:
+        pruned = {sym: st for sym, st in state.items() if sym in allowed}
+        if len(pruned) != len(state):
+            print(f"  Pruned {len(state) - len(pruned)} non-allowlisted symbols from saved state.\n")
+        state = pruned
+    global _last_allowlist_snapshot
+    _last_allowlist_snapshot = allowed
     tick_count = 0
     heartbeat_every = max(1, round(60 / config.BUCKET_POLL_SECONDS))
 
     with open(config.LIQ_SIGNALS_FILE, "a") as f_out:
         while True:
+            log_allowlist_change(config.load_traded_symbols())
             df = load_events()
             n_events = len(df) if not df.empty else 0
             state = process_tick(df, state, f_out)

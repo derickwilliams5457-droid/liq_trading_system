@@ -43,14 +43,6 @@ import config
 import data_cache
 import ratelimit
 
-try:
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-    import plotly.colors as pcolors
-except ImportError:
-    print("This script needs plotly: pip install plotly --break-system-packages")
-    sys.exit(1)
-
 BASE = "https://fapi.binance.com"
 SPOT_BASE = "https://api.binance.com"
 TIMEOUT = 10
@@ -475,6 +467,7 @@ SHORT_COLORSCALE = "Blues"  # short liquidations = forced buying/squeeze if trig
 
 
 def color_and_width_for_notional(notional, min_n, max_n, colorscale):
+    import plotly.colors as pcolors  # lazy: only the standalone chart needs plotly
     if max_n <= min_n:
         norm = 0.5
     else:
@@ -489,6 +482,8 @@ def color_and_width_for_notional(notional, min_n, max_n, colorscale):
 
 
 def build_figure(symbol, interval, precision, candles, spot_candles, rays, notional_floor):
+    import plotly.graph_objects as go       # lazy: only the standalone chart needs plotly
+    from plotly.subplots import make_subplots
     times = [to_dt(c["open_time"]) for c in candles]
 
     fig = make_subplots(
@@ -756,8 +751,12 @@ def main():
     print(f"  {len(rays)} rays at or above the {notional_floor:,.0f} USDT floor "
           f"({long_n} long, {short_n} short).")
 
-    fig = build_figure(symbol, interval, precision, candles, spot_candles, rays, notional_floor)
-    fig.write_html(output, include_plotlyjs="cdn")
+    try:
+        fig = build_figure(symbol, interval, precision, candles, spot_candles, rays, notional_floor)
+        fig.write_html(output, include_plotlyjs="cdn")
+    except ImportError:
+        print("This script needs plotly to build the chart: pip install plotly --break-system-packages")
+        sys.exit(1)
     print(f"Saved interactive chart to {output}")
 
 
