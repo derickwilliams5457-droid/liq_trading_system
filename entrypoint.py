@@ -29,9 +29,11 @@ import threading
 import time
 
 STAGES = [
-    ("liq_stream", ["python", "-u", "liq_stream.py"], 0),
-    ("liq_bucket", ["python", "-u", "liq_bucket.py"], 5),
-    ("run_bot",    ["python", "-u", "run_bot.py"],     10),
+    ("dash",        ["python", "-u", "dash.py"],          0),
+    ("liq_stream",  ["python", "-u", "liq_stream.py"],    0),
+    ("liq_bucket",  ["python", "-u", "liq_bucket.py"],    5),
+    ("run_bot",     ["python", "-u", "run_bot.py"],      10),
+    ("maintenance", ["python", "-u", "maintenance.py"],  15),
 ]
 
 RESTART_DELAY_SECONDS = 5

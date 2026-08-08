@@ -3,3 +3,5 @@ data/
 __pycache__/
 *.pyc
 .venv/
+.venv-1/
+liq_chart_*.html

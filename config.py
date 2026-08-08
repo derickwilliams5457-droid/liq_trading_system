@@ -45,6 +45,61 @@ PRE_SPIKE_SIGNAL     = "pre_activity_spike"   # emitted 15s before candle close 
 MIN_ACTIVITY_USD     = 1000  # a bucket only counts as "active" if its LARGEST SINGLE liquidation >= this —
                               # cumulative volume doesn't matter; ten $100 liqs adding to $1,000 stay "silent"
 
+# ── Tradeable-symbol allowlist (liq_bucket.py) ────────────────────────────────
+# Only symbols in this file may produce signals. liq_bucket.py drops every
+# other symbol from the liquidation CSV at the bucket level, so run_bot.py
+# never sees a signal — and never runs strategy/metrics — for coins outside
+# the list. One symbol per line; blank lines and '#' comments are ignored.
+# The list is re-read automatically whenever the file's mtime changes, so
+# edits take effect on the next poll without restarting any process. If the
+# file is missing the filter is DISABLED (loudly logged) so a typo'd path
+# can't silently kill all trading.
+TRADED_SYMBOLS_FILE = Path(os.getenv("LIQ_SYMBOLS_FILE", BASE_DIR / "binance_futures_symbols.txt"))
+
+_allowlist_mtime: int | None = None   # st_mtime_ns of the last successful load
+_allowlist: set | None = None
+
+
+def load_traded_symbols() -> set | None:
+    """Return the allowlist as an upper-cased set of symbols, or None if the
+    file is missing (filter disabled).
+
+    Cached on the file's mtime: whenever the file changes, the set is rebuilt
+    on the next call, so removing a symbol from the txt stops it being traded
+    on the very next poll — no process restart needed."""
+    global _allowlist_mtime, _allowlist
+    try:
+        mtime = TRADED_SYMBOLS_FILE.stat().st_mtime_ns
+    except OSError:
+        _allowlist_mtime = None
+        _allowlist = None
+        return None
+    if mtime != _allowlist_mtime:
+        try:
+            allowed = set()
+            for raw in TRADED_SYMBOLS_FILE.read_text().splitlines():
+                sym = raw.strip().upper()
+                if sym and not sym.startswith("#"):
+                    allowed.add(sym)
+        except OSError:
+            allowed = None
+        _allowlist_mtime = mtime
+        _allowlist = allowed
+    return _allowlist
+
+
+def is_traded_symbol(symbol: str) -> bool:
+    """True when the symbol may be traded. With no allowlist (None) every
+    symbol passes; otherwise it must be in the allowlist (case-insensitive).
+    A missing/empty symbol never passes when a filter is active."""
+    allowed = load_traded_symbols()
+    if allowed is None:
+        return True
+    if not symbol:
+        return False
+    return symbol.upper() in allowed
+
+
 # Two different notations for the same "3 minutes", used in different places:
 #   EXCHANGE_TIMEFRAME — Binance/ccxt notation ("3m") — for fetch_ohlcv() calls
 #   PANDAS_FREQ        — pandas offset alias ("3min") — for .resample() / .floor()
@@ -98,8 +153,16 @@ MIN_VOTES_AGREE      = 2       # need at least 2 of the 3 votes agreeing to call
 # candle is much tighter — PRE_CALC_EXECUTE_SECONDS. Once R:R passes, execute
 # immediately; never sit on the 60s budget.
 ENTRY_TIMEOUT_SECONDS   = 60
-PRE_CALC_EXECUTE_SECONDS = 10   # max seconds INTO the new candle to recompute R:R and fill the limit order
+# COMPUTE window only: max seconds INTO the new candle to fetch the actual close
+# price, recompute R:R, and PLACE the limit order. Once placed, the order's fill
+# window is decoupled — it lives LIMIT_FILL_WINDOW_SECONDS before being cancelled.
+PRE_CALC_EXECUTE_SECONDS = 20
 PRE_CLOSE_SECONDS       = 15    # the pre-spike signal is designed to arrive ~15s before close
+# Resting LIMIT entry lifetime: how long an unfilled limit order stays live after
+# placement before the entry follower cancels it. Independent of the compute
+# deadline above — a limit only fills if price comes back to it, so it gets a
+# full window to be revisited.
+LIMIT_FILL_WINDOW_SECONDS = 120
 ORDER_POLL_SECONDS      = 1     # how often to check fill status within that window
 
 # ── Rectangle strategy (strategy.py + allocation.py) ──────────────────────────
@@ -153,11 +216,78 @@ RATE_LIMIT_WEIGHT_PER_MIN = 1800    # global budget: aggTrades=20, klines=2, exc
 # ── Trader / execution (trader.py) ───────────────────────────────────────────
 SYMBOL_QUOTE           = "USDT"
 TESTNET                = os.getenv("LIQ_TESTNET", "true").lower() == "true"   # default to testnet — flip explicitly for live
-RISK_PER_TRADE_PCT     = float(os.getenv("LIQ_RISK_PCT", "0.5"))   # % of account equity risked per trade
+RISK_PER_TRADE_USD     = float(os.getenv("LIQ_RISK_USD", "500"))   # fixed USDT margin allocated per trade; position notional = USD * LEVERAGE
 LEVERAGE                = int(os.getenv("LIQ_LEVERAGE", "5"))
 POSITION_POLL_SECONDS   = 5     # how often trader.py polls open-position PnL
 POSITION_CLOSED_CONFIRM_POLLS = 2  # consecutive polls with no position before a trade is declared closed
 MAX_CONCURRENT_POSITIONS = 3     # multiple positions open at a time (multi-coin execution)
+# If the entry follower can't poll an order for this many consecutive ticks
+# AND its fill window has already expired, the order is abandoned instead of
+# reprinting the error every second forever.
+MAX_POLL_FAILURES = 3
 
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+
+# ── Bybit mirror (bybit_mirror.py) ────────────────────────────────────────────
+# Mirrors the trades the system produces on Bybit as well. Every exchange is an
+# INDEPENDENT adapter with its own credentials, testnet flag, per-trade dollar
+# allocation, leverage and concurrent-position cap. If creds are empty or
+# BYBIT_ENABLED=false the mirror simply isn't started — the bot stays Binance-only.
+BYBIT_ENABLED  = os.getenv("BYBIT_ENABLED", "true").lower() == "true"
+# true = Bybit Demo Trading (https://api-demo.bybit.com) — the pybit sketch's
+# `demo=True`. Set false for real funds only when you're ready.
+BYBIT_TESTNET  = os.getenv("BYBIT_TESTNET", "true").lower() == "true"
+BYBIT_API_KEY    = os.getenv("BYBIT_API_KEY", "")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+
+# Per-exchange allocation: each exchange risks its OWN fixed dollar amount.
+# Position notional = USD * LEVERAGE, qty = notional / (that exchange's entry).
+# This is what makes PnL track across exchanges even though prices differ.
+BYBIT_RISK_PER_TRADE_USD = float(os.getenv("BYBIT_RISK_USD", "500"))
+BYBIT_LEVERAGE           = int(os.getenv("BYBIT_LEVERAGE", "5"))
+
+# Bybit has its OWN 3-trade concurrent cap, independent of Binance's. If
+# Binance is full but Bybit has slots, the mirror still takes the trade (and
+# vice versa). A coin not listed on Bybit simply aborts the Bybit side.
+BYBIT_MAX_CONCURRENT_POSITIONS = int(os.getenv("BYBIT_MAX_CONCURRENT_POSITIONS", "3"))
+BYBIT_ORDER_POLL_SECONDS  = 1     # entry-follower fill/cancel poll cadence
+# If the entry follower can't poll an order for this many consecutive ticks
+# AND its fill window has already expired, the order is abandoned instead of
+# reprinting the error every second forever. (Bybit's fetchOrder only reaches
+# the account's last 500 orders; a stale order id can't be polled at all.)
+BYBIT_MAX_POLL_FAILURES = 3
+BYBIT_LIMIT_FILL_WINDOW_SECONDS = 120   # resting LIMIT entry lifetime before auto-cancel
+BYBIT_POSITION_POLL_SECONDS = 5   # mirror monitor PnL poll cadence
+BYBIT_POSITION_CLOSED_CONFIRM_POLLS = 2  # consecutive absent polls before a Bybit trade is declared closed
+
+# ── Lightweight read-only dashboard (dash.py) ──────────────────────────────────
+# Serves a tiny interactive page over HTTP showing per-exchange equity, PnL,
+# open/closed positions and recent activity. Purely observational: dash.py only
+# READS data/performance.csv + data/trade_log.jsonl in a background thread, writes
+# nothing, and makes no exchange calls — it cannot affect the pipeline.
+#
+# Railway injects a $PORT env var and routes the public domain to it. When
+# $PORT is present we bind 0.0.0.0:$PORT (so the healthcheck + domain work);
+# locally we bind 127.0.0.1:8765 so the page isn't exposed on the LAN.
+DASH_HOST = os.getenv("DASH_HOST", "0.0.0.0" if os.getenv("PORT") else "127.0.0.1")
+DASH_PORT = int(os.getenv("DASH_PORT") or os.getenv("PORT") or "8765")
+DASH_REFRESH_SECONDS = float(os.getenv("DASH_REFRESH_SECONDS", "2"))
+# Equity = starting balance + realized PnL + open unrealized PnL, per exchange.
+# Default 0 -> the dashboard shows net P&L. Set these to your real starting
+# balances for true equity figures.
+DASH_START_BALANCE_BINANCE = float(os.getenv("DASH_START_BALANCE_BINANCE", "0"))
+DASH_START_BALANCE_BYBIT = float(os.getenv("DASH_START_BALANCE_BYBIT", "0"))
+
+# ── Data retention (maintenance.py) ────────────────────────────────────────────
+# Three files grow without bound and on a small cloud disk they eventually fill
+# it up: liquidations.csv (every liq event), performance.csv (every PnL poll
+# while a position is open) and trade_log.jsonl (every opened/closed event).
+# maintenance.py trims them back to these caps. Safe because every consumer
+# resumes from its own persisted cursor — dropping old rows never breaks the
+# pipeline. liq_signals.jsonl is deliberately NOT trimmed: run_bot.py tails it
+# live and a truncation could race a just-written signal.
+MAINTENANCE_INTERVAL_SECONDS = int(os.getenv("MAINTENANCE_INTERVAL_SECONDS", "3600"))
+MAX_LIQ_CSV_ROWS       = int(os.getenv("MAX_LIQ_CSV_ROWS", "250000"))
+MAX_PERFORMANCE_ROWS   = int(os.getenv("MAX_PERFORMANCE_ROWS", "50000"))
+MAX_TRADE_LOG_LINES    = int(os.getenv("MAX_TRADE_LOG_LINES", "50000"))

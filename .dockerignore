@@ -1,0 +1,16 @@
+# Secrets — never bake API keys into an image layer
+.env
+
+# Local runtime state (persisted via a Railway volume / compose named volume instead)
+data/
+
+# Local environments / tooling — bloats the image if copied
+.venv*
+__pycache__/
+*.pyc
+.vscode/
+.git/
+.gitignore
+
+# Build/scratch files
+*.html

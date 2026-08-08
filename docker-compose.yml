@@ -1,20 +1,46 @@
 version: "3.9"
 
-# Three long-running services sharing one volume (./data) so they can pass
-# data through the CSV / JSONL files exactly like they do when run locally
-# in separate VS Code terminals. Bring the whole pipeline up with:
-#     docker compose up -d
+# Five long-running services sharing ONE named volume (`liq_data`, mounted at
+# /data). The Dockerfile sets LIQ_DATA_DIR=/data, so every service writes its
+# CSV/JSONL state into the shared volume — the same file-based contract as
+# local dev, but surviving restarts AND `docker compose down`.
+#
+# Bring the whole pipeline up with:
+#     docker compose up -d --build
 # Watch one service's logs with:
 #     docker compose logs -f bot
-# Tear down: docker compose down
+# Tear down (keeps the volume): docker compose down
+# Full reset (wipes state):      docker compose down -v
+#
+# NOTE: this switched from a `./data` bind mount to the `liq_data` named
+# volume so a non-root container user can always write. If you previously ran
+# compose with ./data and want to keep that history, copy it in first, e.g.:
+#     docker run --rm -v liq_data:/to -v $PWD/data:/from alpine \
+#       sh -c 'cp -a /from/. /to/'
 
 services:
+  dash:
+    build: .
+    command: python dash.py
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    volumes:
+      - liq_data:/data
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8765/healthz',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   liq_stream:
     build: .
     command: python liq_stream.py
     restart: unless-stopped
     volumes:
-      - ./data:/app/data
+      - liq_data:/data
     env_file:
       - .env
 
@@ -25,7 +51,7 @@ services:
     depends_on:
       - liq_stream
     volumes:
-      - ./data:/app/data
+      - liq_data:/data
     env_file:
       - .env
 
@@ -36,6 +62,20 @@ services:
     depends_on:
       - liq_bucket
     volumes:
-      - ./data:/app/data
+      - liq_data:/data
     env_file:
       - .env
+
+  maintenance:
+    build: .
+    command: python maintenance.py
+    restart: unless-stopped
+    depends_on:
+      - liq_stream
+    volumes:
+      - liq_data:/data
+    env_file:
+      - .env
+
+volumes:
+  liq_data:
