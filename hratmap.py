@@ -43,13 +43,9 @@ import config
 import data_cache
 import ratelimit
 
-try:
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-    import plotly.colors as pcolors
-except ImportError:
-    print("This script needs plotly: pip install plotly --break-system-packages")
-    sys.exit(1)
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.colors as pcolors
 
 BASE = "https://fapi.binance.com"
 SPOT_BASE = "https://api.binance.com"
