@@ -40,7 +40,7 @@ BUCKET_MINUTES      = 3     # width of each time bucket
 SILENCE_THRESHOLD    = 5     # consecutive silent buckets -> next active bucket fires "activity_spike"
 ACTIVITY_THRESHOLD   = 5     # consecutive active buckets  -> next silent bucket fires "collapse"
 BUCKET_POLL_SECONDS  = 15    # how often liq_bucket.py re-scans the CSV for the current bucket
-TRIGGER_SIGNAL       = "activity_spike"   # which signal type the strategy engine acts on (post-close fallback)
+TRIGGER_SIGNAL       = "collapse"   # which signal type the strategy engine acts on (post-close fallback)
 PRE_SPIKE_SIGNAL     = "pre_activity_spike"   # emitted 15s before candle close for pre-calculation
 MIN_ACTIVITY_USD     = 1000  # a bucket only counts as "active" if its LARGEST SINGLE liquidation >= this —
                               # cumulative volume doesn't matter; ten $100 liqs adding to $1,000 stay "silent"
