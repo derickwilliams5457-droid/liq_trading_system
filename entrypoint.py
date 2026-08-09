@@ -22,11 +22,14 @@ Usage:
     python entrypoint.py
 """
 
+import os
 import signal
 import subprocess
 import sys
 import threading
 import time
+
+LIQ_DATA_DIR = os.environ.get("LIQ_DATA_DIR", "/tmp/data")
 
 STAGES = [
     ("dash",        ["python", "-u", "dash.py"],          0),
@@ -88,9 +91,29 @@ def _shutdown(signum, frame):
     sys.exit(0)
 
 
+def _check_data_dir_writable(path: str):
+    """Pre-flight check: fail fast with a clear error instead of letting a
+    child stage (e.g. liq_stream.py) crash obscurely on its first CSV write.
+    """
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".supervisor_write_check")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        print(f"[supervisor] data dir OK: {path} is writable", flush=True)
+    except Exception as e:
+        print(f"[supervisor] FATAL: data dir '{path}' is not writable: {e}", flush=True)
+        print("[supervisor] check that the volume mount is chowned to the "
+              "container's runtime user before startup.", flush=True)
+        sys.exit(1)
+
+
 def main():
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
+
+    _check_data_dir_writable(LIQ_DATA_DIR)
 
     print(f"[supervisor] starting {len(STAGES)} stages in one container: "
           f"{', '.join(s[0] for s in STAGES)}", flush=True)
