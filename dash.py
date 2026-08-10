@@ -595,7 +595,7 @@ function render(d){
         <td class="right">${exPnlCell}<div class="muted" style="font-size:11px">equity ${fmt(v.exchange_equity,2)} ${v.exchange_wallet!=null?`· wallet ${fmt(v.exchange_wallet,2)}`:""} · unreal ${v.exchange_unrealized!=null?fmt(v.exchange_unrealized,2):"—"}</div></td>
         <td class="right ${cls(v.delta)}">${deltaCell}</td></tr>`;
     }).join("")}</table>
-    <div class="muted" style="font-size:11px;margin-top:6px">exchange PnL = equity (margin balance) − starting balance. Set DASH_START_BALANCE_* to your real starting balances for an exact match; residual delta = fees/funding/exit-vs-last-mark + any position the bot isn't tracking.</div>`
+    <div class="muted" style="font-size:11px;margin-top:6px">exchange PnL = equity (margin balance) − starting balance. Set DASH_START_BALANCE_* to your real starting balances for an exact match. Closed trades carry the exchange's income-derived realized PnL (real exit + fees + funding); residual delta = adopted/untracked positions (booked at last mark) + open-position unrealized timing + assets outside the perp margin.</div>`
     :"<span class='muted'>waiting for exchange account snapshot…</span>";
 
 

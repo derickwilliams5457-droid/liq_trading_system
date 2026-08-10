@@ -224,6 +224,57 @@ class BybitMirror:
             print(f"  [bybit] Account state fetch failed: {e}")
             return None
 
+    @staticmethod
+    def _opened_ms(meta: dict) -> int | None:
+        opened = (meta or {}).get("opened_at")
+        if not opened:
+            return None
+        try:
+            return int(datetime.fromisoformat(str(opened)).timestamp() * 1000)
+        except Exception:
+            return None
+
+    def fetch_realized_pnl(self, symbol: str, since_ms: int | None) -> float | None:
+        """The exchange's OWN realized PnL for a closed position via
+        /v5/position/closed-pnl (real exit price + fees + funding). Demo
+        trading rejects this endpoint, so on testnet this returns None and the
+        caller falls back to the last mark PnL."""
+        try:
+            params = {"category": "linear", "symbol": symbol, "limit": 50}
+            r = self._guarded(self.exchange.privateGetV5PositionClosedPnl, params)
+            rows = ((r or {}).get("result") or {}).get("list") or []
+            if not rows:
+                return None
+            total = 0.0
+            for row in rows:
+                ct = int(row.get("createdTime") or 0)
+                if since_ms is not None and ct < since_ms:
+                    continue
+                tp = row.get("totalPnl")
+                if tp not in (None, ""):
+                    total += float(tp)
+                else:
+                    total += float(row.get("realizedPnl") or 0)
+                    total += float(row.get("fundingFee") or 0)
+            # Same trust rule as Trader: a real close always books a non-zero
+            # PnL, so a zero sum falls back to the last mark PnL.
+            return total if total != 0.0 else None
+        except Exception as e:
+            print(f"  [bybit] Closed-PnL fetch failed for {symbol}: {e}")
+            return None
+
+    def _final_realized(self, symbol: str, meta: dict):
+        """Same contract as Trader._final_realized: prefer the exchange's
+        closed-PnL figure for positions tracked from their real open; adopted
+        positions (no trustworthy opened_at) fall back to last mark PnL."""
+        if not meta.get("adopted"):
+            since = self._opened_ms(meta)
+            if since is not None:
+                rpnl = self.fetch_realized_pnl(symbol, since)
+                if rpnl is not None:
+                    return rpnl, "income"
+        return meta.get("last_pnl", ""), "mark"
+
     def pending_entry_count(self) -> int:
         with self._pending_lock:
             return sum(1 for e in self._pending_entries.values() if not e.get("resolved"))
@@ -572,13 +623,18 @@ class BybitMirror:
                         absent_streaks[symbol] = absent_streaks.get(symbol, 0) + 1
                         if absent_streaks[symbol] >= config.BYBIT_POSITION_CLOSED_CONFIRM_POLLS:
                             meta = self._open_trades.pop(symbol)
+                            rpnl, source = self._final_realized(symbol, meta)
                             self._log_performance_row(
                                 meta["symbol"], meta["direction"], meta["qty"], meta["entry"],
                                 meta["sl"], meta["tp"],
-                                meta.get("last_mark", ""), meta.get("last_pnl", ""), "closed",
+                                meta.get("last_mark", ""), rpnl, "closed",
                             )
-                            self._log_trade_event({"event": "closed", **meta})
-                            print(f"  [bybit] Position closed: {meta['symbol']}")
+                            self._log_trade_event({
+                                "event": "closed", "realized_pnl": rpnl,
+                                "pnl_source": source, **meta,
+                            })
+                            print(f"  [bybit] Position closed: {meta['symbol']} "
+                                  f"(realized {rpnl} via {source})")
                             absent_streaks.pop(symbol, None)
                             changed = True
                 if changed:

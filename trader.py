@@ -150,6 +150,53 @@ class Trader:
             print(f"  [trader] Account state fetch failed: {e}")
             return None
 
+    @staticmethod
+    def _opened_ms(meta: dict) -> int | None:
+        opened = (meta or {}).get("opened_at")
+        if not opened:
+            return None
+        try:
+            return int(datetime.fromisoformat(str(opened)).timestamp() * 1000)
+        except Exception:
+            return None
+
+    def fetch_realized_pnl(self, symbol: str, since_ms: int | None) -> float | None:
+        """The exchange's OWN realized PnL for a position: income history for
+        the symbol since it opened, summing REALIZED_PNL + COMMISSION +
+        FUNDING_FEE. This includes the real exit price plus fees/funding — vs
+        our last-mark estimate which is what was never matched the exchange.
+        Returns None on any failure so the caller falls back to last mark PnL."""
+        try:
+            params = {"symbol": symbol, "limit": 1000}
+            if since_ms is not None:
+                params["startTime"] = since_ms
+            inc = self._guarded(self.exchange.fapiprivateGetIncome, params)
+            total = 0.0
+            for r in inc:
+                if r.get("incomeType") in ("REALIZED_PNL", "COMMISSION", "FUNDING_FEE"):
+                    total += float(r.get("income") or 0)
+            # A genuinely closed position always books income (at least a
+            # commission + a realized pnl), so an empty/zero sum means the
+            # data isn't trustworthy yet — caller falls back to last mark PnL.
+            return total if total != 0.0 else None
+        except Exception as e:
+            print(f"  [trader] Income fetch failed for {symbol}: {e}")
+            return None
+
+    def _final_realized(self, symbol: str, meta: dict):
+        """Realized PnL to book for a closed position. Prefer the exchange's
+        income-derived figure, but ONLY when the position was tracked from its
+        real open (adopted positions have no trustworthy opened_at — an income
+        window starting 'now' would wrongly book 0). Fall back to the last
+        observed mark PnL otherwise."""
+        if not meta.get("adopted"):
+            since = self._opened_ms(meta)
+            if since is not None:
+                rpnl = self.fetch_realized_pnl(symbol, since)
+                if rpnl is not None:
+                    return rpnl, "income"
+        return meta.get("last_pnl", ""), "mark"
+
     def pending_entry_count(self) -> int:
         with self._pending_lock:
             return sum(1 for e in self._pending_entries.values() if not e.get("resolved"))
@@ -657,13 +704,18 @@ class Trader:
                         absent_streaks[symbol] = absent_streaks.get(symbol, 0) + 1
                         if absent_streaks[symbol] >= config.POSITION_CLOSED_CONFIRM_POLLS:
                             meta = self._open_trades.pop(symbol)
+                            rpnl, source = self._final_realized(symbol, meta)
                             self._log_performance_row(
                                 meta["symbol"], meta["direction"], meta["qty"], meta["entry"],
                                 meta["sl"], meta["tp"],
-                                meta.get("last_mark", ""), meta.get("last_pnl", ""), "closed",
+                                meta.get("last_mark", ""), rpnl, "closed",
                             )
-                            self._log_trade_event({"event": "closed", **meta})
-                            print(f"  [trader] Position closed: {meta['symbol']}")
+                            self._log_trade_event({
+                                "event": "closed", "realized_pnl": rpnl,
+                                "pnl_source": source, **meta,
+                            })
+                            print(f"  [trader] Position closed: {meta['symbol']} "
+                                  f"(realized {rpnl} via {source})")
                             absent_streaks.pop(symbol, None)
                             changed = True
                 if changed:
