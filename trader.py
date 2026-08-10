@@ -22,20 +22,20 @@ monitor loop):
     python trader.py
 """
 
-import csv
-import json
+import re
 import threading
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 import ccxt
 
 import config
+import perfio
 import ratelimit
 
 
 class Trader:
+    EXCHANGE_ID = "binance"
     def __init__(self, mirror=None):
         """mirror: optional BybitMirror adapter. When attached, every trade this
         Trader places on Binance is ALSO dispatched to the mirror, which
@@ -62,7 +62,12 @@ class Trader:
         if config.TESTNET:
             self.exchange.enableDemoTrading(True)
 
+        # Open trades tracked for reporting/PnL. Restored from the persistent
+        # ledger (trades.json) so a restart never orphans a live position —
+        # the monitor re-adopts anything it finds on the exchange anyway.
         self._open_trades: dict = {}   # symbol -> meta dict for each open position
+        ledger = perfio.load_ledger()
+        self._open_trades.update(ledger.get(self.EXCHANGE_ID, {}))
 
         # Entry follower: owns every resting LIMIT entry order until it fills
         # (then attaches TP/SL + tracks the position) or is cancelled.
@@ -71,7 +76,7 @@ class Trader:
         self._follower_thread = threading.Thread(target=self._entry_follower_loop, daemon=True)
         self._follower_thread.start()
 
-        self._init_performance_csv()
+        perfio.ensure_perf_header()
 
     # ── Serialized, ban-aware ccxt call ────────────────────────────────
     # Every Binance REST call in the process shares one at-a-time lock + the
@@ -99,6 +104,51 @@ class Trader:
         except Exception as e:
             print(f"  [trader] Unexpected error fetching positions: {e}")
             return []
+
+    def fetch_account_state(self) -> dict | None:
+        """Exchange-reported account state for PnL verification. Binance's
+        fapi account exposes totalWalletBalance (realized wallet), totalUnrealizedProfit
+        and totalMarginBalance (= wallet + unrealized = equity). Best-effort:
+        returns None on any failure so the monitor never blocks on it."""
+        try:
+            bal = self._guarded(self.exchange.fetch_balance)
+            info = bal.get("info") or {}
+
+            def f(*keys):
+                for k in keys:
+                    v = info.get(k)
+                    if v not in (None, ""):
+                        try:
+                            return float(v)
+                        except (TypeError, ValueError):
+                            pass
+                return None
+
+            wallet = f("totalWalletBalance")
+            unrealized = f("totalUnrealizedProfit")
+            equity = f("totalMarginBalance")
+            available = f("totalAvailableBalance")
+            if available is None:
+                try:
+                    available = float(bal.get("USDT", {}).get("free") or 0)
+                except (TypeError, ValueError):
+                    available = None
+            if equity is None and wallet is not None and unrealized is not None:
+                equity = wallet + unrealized
+            if wallet is None:
+                return None
+            return {
+                "wallet": wallet,
+                "unrealized": unrealized,
+                "equity": equity,
+                "available": available,
+                "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+        except ratelimit.BinanceBanned:
+            return None   # the positions poll already sleeps out the ban
+        except Exception as e:
+            print(f"  [trader] Account state fetch failed: {e}")
+            return None
 
     def pending_entry_count(self) -> int:
         with self._pending_lock:
@@ -277,6 +327,9 @@ class Trader:
             "cancel_at": time.time() + config.LIMIT_FILL_WINDOW_SECONDS,
             "cancel_attempted": False,
             "attached": False,
+            "attached_sl": False,
+            "attached_tp": False,
+            "attach_failures": 0,
             "resolved": False,
             "filled": False,
             "event": threading.Event(),
@@ -390,32 +443,93 @@ class Trader:
                 print(f"  [trader] Filled {rec['direction'].upper()} {rec['symbol']} "
                       f"qty={rec['meta']['qty']} entry={rec['entry_price']}"
                       f" (status={status}, filled={filled_qty})")
-            if self._attach_tp_sl(rec):
+            result = self._attach_tp_sl(rec)
+            if result is True:
                 self._finalize_filled(rec)  # TP/SL on, trade fully opened
+            elif result == "abandon":
+                # Permanent attach failure (no position behind the fill, or the
+                # retry cap ran out) — stop retrying. The trade stays tracked in
+                # _open_trades so the monitor still closes it out when the
+                # exchange-side position disappears; it just never gets TP/SL.
+                self._finalize_failed(rec, "attach_abandoned")
         elif status in ("canceled", "expired", "rejected"):
             self._finalize_failed(rec, status)
 
     def _attach_tp_sl(self, rec):
+        """Idempotent TP/SL attach after a LIMIT fill. Each half (STOP_MARKET /
+        TAKE_PROFIT_MARKET, closePosition) is placed at most once — a Binance
+        -4130 ("a closePosition order with GTE already exists") is treated as
+        success for that half, so a half-completed attach from an earlier attempt
+        recovers instead of re-submitting the order forever. -4509 ("no open
+        position behind GTE closePosition") is permanent — the position is gone,
+        so the entry is abandoned rather than retried. Any other error retries
+        up to MAX_TP_SL_ATTACH_ATTEMPTS, then abandons so a filled-but-unmanageable
+        entry can never reprint oco_failed every second forever.
+
+        Returns True (attach complete), False (retry later), or "abandon"
+        (permanent failure — caller finalizes the rec)."""
         if rec.get("attached"):
             return True
         close_side = "sell" if rec["direction"] == "long" else "buy"
-        try:
-            self._guarded(
-                self.exchange.create_order, rec["symbol"], "STOP_MARKET", close_side, rec["qty"],
-                params={"stopPrice": rec["sl"], "closePosition": True},
-            )
-            self._guarded(
-                self.exchange.create_order, rec["symbol"], "TAKE_PROFIT_MARKET", close_side, rec["qty"],
-                params={"stopPrice": rec["tp"], "closePosition": True},
-            )
-            rec["attached"] = True
-            return True
-        except ratelimit.BinanceBanned:
-            return False  # never poke an active ban — follower retries on a later cycle
-        except Exception as e:
-            print(f"  [trader] TP/SL attach failed after LIMIT fill for {rec['symbol']}: {e}")
-            self._log_trade_event({"event": "oco_failed", "error": str(e), **rec["levels"]})
-            return False
+        halves = [
+            ("sl", "STOP_MARKET", rec["sl"]),
+            ("tp", "TAKE_PROFIT_MARKET", rec["tp"]),
+        ]
+        for key, order_type, stop_price in halves:
+            if rec.get(f"attached_{key}"):
+                continue
+            try:
+                self._guarded(
+                    self.exchange.create_order, rec["symbol"], order_type, close_side, rec["qty"],
+                    params={"stopPrice": stop_price, "closePosition": True},
+                )
+                rec[f"attached_{key}"] = True
+            except ratelimit.BinanceBanned:
+                return False  # never poke an active ban — follower retries on a later cycle
+            except Exception as e:
+                code = self._binance_error_code(e)
+                if code == -4130:
+                    # The closePosition order for this half already exists (left
+                    # over from a previous half-completed attach). Count it done.
+                    rec[f"attached_{key}"] = True
+                elif code == -4509:
+                    # No position behind the fill — GTE closePosition can never be
+                    # placed. Permanent: abandon this entry so it stops retrying.
+                    print(f"  [trader] TP/SL attach aborted for {rec['symbol']} — no open "
+                          f"position behind the fill ({str(e)[:160]}).")
+                    self._log_trade_event({
+                        "event": "oco_failed",
+                        "reason": "no_position",
+                        "error": str(e),
+                        **rec["levels"],
+                    })
+                    return "abandon"
+                else:
+                    rec["attach_failures"] = rec.get("attach_failures", 0) + 1
+                    if rec["attach_failures"] >= config.MAX_TP_SL_ATTACH_ATTEMPTS:
+                        print(f"  [trader] TP/SL attach failed {rec['attach_failures']} "
+                              f"times for {rec['symbol']} — abandoning.")
+                        self._log_trade_event({
+                            "event": "oco_failed",
+                            "reason": "max_attempts",
+                            "attempts": rec["attach_failures"],
+                            "error": str(e),
+                            **rec["levels"],
+                        })
+                        return "abandon"
+                    print(f"  [trader] TP/SL attach failed after LIMIT fill for {rec['symbol']}: {e}")
+                    self._log_trade_event({"event": "oco_failed", "error": str(e), **rec["levels"]})
+                    return False
+
+        rec["attached"] = True
+        return True
+
+    @staticmethod
+    def _binance_error_code(e) -> int | None:
+        """Extract the numeric `code` from a ccxt ExchangeError that embeds the
+        raw Binance body, e.g. `binance {"code":-4130,"msg":"..."}`."""
+        m = re.search(r'"code"\s*:\s*(-?\d+)', str(e))
+        return int(m.group(1)) if m else None
 
     def _finalize_filled(self, rec):
         with self._pending_lock:
@@ -441,52 +555,49 @@ class Trader:
         rec["event"].set()
 
     # ── Monitoring / performance logging ────────────────────────────────
-    def _init_performance_csv(self):
-        csv_path = Path(config.PERFORMANCE_CSV)
-        # Ensure target directory exists before opening file
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Same file + schema as bybit_mirror.py: a trailing `exchange` column
-        # tags each row binance/bybit so performance_plot.py shows both
-        # exchanges in one equity view. If a legacy file (pre-exchange column)
-        # exists, rewrite the header so columns never misalign.
-        needs_header = not csv_path.exists()
-        if not needs_header:
-            with open(csv_path, "r", encoding="utf-8") as f:
-                header = f.readline().strip()
-            if header and "exchange" not in header:
-                needs_header = True
-        if needs_header:
-            with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f, quoting=csv.QUOTE_MINIMAL).writerow([
-                    "timestamp_utc", "symbol", "direction", "qty", "entry",
-                    "sl", "tp", "mark_price", "unrealized_pnl", "status", "exchange",
-                ])
+    # The EXCHANGE is the source of truth for what is open. Every position
+    # found on the exchange is adopted into the ledger (tracked or untracked)
+    # so it always gets a close row; anything in the ledger that vanishes is
+    # declared closed after POSITION_CLOSED_CONFIRM_POLLS consecutive absent
+    # polls, and the closed row carries the final mark/PnL so realized PnL is
+    # self-contained. A live snapshot is written every poll — the dashboard
+    # reads snapshot.json for "open", never CSV history.
 
     def _log_performance_row(self, symbol, direction, qty, entry, sl, tp, mark_price, pnl, status):
-        csv_path = Path(config.PERFORMANCE_CSV)
-        with open(csv_path, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f, quoting=csv.QUOTE_MINIMAL).writerow([
-                datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                symbol, direction, qty, entry, sl, tp, mark_price, pnl, status,
-                "binance",
-            ])
+        perfio.append_perf_row([
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            symbol, direction, qty, entry, sl, tp, mark_price, pnl, status,
+            self.EXCHANGE_ID,
+        ])
 
     def _log_trade_event(self, record: dict):
-        record["exchange"] = "binance"
+        record["exchange"] = self.EXCHANGE_ID
         record["time"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        log_path = Path(config.TRADE_LOG_FILE)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, default=str) + "\n")
+        perfio.append_log_event(record)
+
+    def _adopt_position(self, symbol, pos, contracts) -> dict:
+        """A position exists on the exchange that isn't in the ledger (opened
+        before a restart, or never tracked). Build best-effort meta and adopt
+        it so it gets a real close path instead of a forever-"open" ghost row."""
+        meta = {
+            "symbol": symbol,
+            "direction": "long" if contracts > 0 else "short",
+            "qty": abs(contracts),
+            "entry": float(pos.get("entryPrice") or 0),
+            "sl": "",
+            "tp": "",
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+            "adopted": True,
+        }
+        self._open_trades[symbol] = meta
+        self._log_trade_event({"event": "adopted_position", **meta})
+        perfio.update_ledger(self.EXCHANGE_ID, self._open_trades)
+        print(f"  [trader] Adopted untracked position: {symbol} "
+              f"{meta['direction']} qty={meta['qty']}")
+        return meta
 
     def monitor_loop(self):
-        """Run forever: poll open positions, log PnL, detect closes.
-        Supports multiple concurrent positions — each tracked trade is only
-        declared closed after its symbol has been absent for
-        POSITION_CLOSED_CONFIRM_POLLS consecutive polls. A position seen
-        without any trade meta is logged best-effort so it is never
-        invisible to the CSV."""
+        """Run forever: poll open positions, log PnL, detect closes, snapshot."""
         print("  [trader] Monitor loop started.")
         absent_streaks: dict[str, int] = {}  # symbol -> consecutive absent polls
         while True:
@@ -498,39 +609,49 @@ class Trader:
                     time.sleep(min(e.remaining, 60.0))
                     continue
 
+                account = self.fetch_account_state()
+                positions_dict = {}
                 open_symbols = set()
+
                 for pos in positions:
                     # ccxt returns the UNIFIED symbol (e.g. "BEAT/USDT:USDT") on a
                     # position, but _open_trades is keyed by the raw exchange id
                     # (e.g. "BEATUSDT"). Use the raw id from pos.info so tracked
-                    # trades match their open position — otherwise every tracked
-                    # trade looks absent and is falsely declared "closed".
+                    # trades match their open position.
                     raw_symbol = (pos.get("info") or {}).get("symbol")
                     symbol = (raw_symbol or pos.get("symbol") or "").upper()
                     open_symbols.add(symbol)
+
                     contracts = float(
                         pos.get("contracts") or pos.get("info", {}).get("positionAmt", 0) or 0
                     )
-                    meta = self._open_trades.get(symbol)
-                    if meta:
-                        absent_streaks[symbol] = 0
-                        self._log_performance_row(
-                            meta["symbol"], meta["direction"], meta["qty"], meta["entry"],
-                            meta["sl"], meta["tp"],
-                            float(pos.get("markPrice") or 0),
-                            float(pos.get("unrealizedPnl") or 0), "open",
-                        )
-                    else:
-                        # Position open but no tracked trade — log best-effort
-                        qty = abs(contracts)
-                        direction = "long" if contracts > 0 else "short"
-                        self._log_performance_row(
-                            symbol, direction, qty, float(pos.get("entryPrice") or 0),
-                            "", "", float(pos.get("markPrice") or 0),
-                            float(pos.get("unrealizedPnl") or 0), "open",
-                        )
+                    mark = float(pos.get("markPrice") or 0)
+                    pnl = float(pos.get("unrealizedPnl") or 0)
 
-                # Check for closed positions (tracked but no longer on exchange)
+                    meta = self._open_trades.get(symbol)
+                    if meta is None:
+                        meta = self._adopt_position(symbol, pos, contracts)
+                    else:
+                        absent_streaks[symbol] = 0
+                    meta["last_mark"] = mark
+                    meta["last_pnl"] = pnl
+                    self._open_trades[symbol] = meta
+
+                    self._log_performance_row(
+                        meta["symbol"], meta["direction"], meta["qty"], meta["entry"],
+                        meta["sl"], meta["tp"], mark, pnl, "open",
+                    )
+                    positions_dict[symbol] = {
+                        "symbol": meta["symbol"], "direction": meta["direction"],
+                        "qty": meta["qty"], "entry": meta["entry"],
+                        "sl": meta["sl"], "tp": meta["tp"],
+                        "mark": mark, "pnl": pnl, "opened_at": meta.get("opened_at", ""),
+                    }
+
+                # Tracked/adopted but no longer on the exchange — confirm-streak
+                # before declaring closed so a transient poll hiccup never books
+                # a fake close.
+                changed = False
                 for symbol in list(self._open_trades.keys()):
                     if symbol not in open_symbols:
                         absent_streaks[symbol] = absent_streaks.get(symbol, 0) + 1
@@ -538,11 +659,17 @@ class Trader:
                             meta = self._open_trades.pop(symbol)
                             self._log_performance_row(
                                 meta["symbol"], meta["direction"], meta["qty"], meta["entry"],
-                                meta["sl"], meta["tp"], "", "", "closed",
+                                meta["sl"], meta["tp"],
+                                meta.get("last_mark", ""), meta.get("last_pnl", ""), "closed",
                             )
                             self._log_trade_event({"event": "closed", **meta})
                             print(f"  [trader] Position closed: {meta['symbol']}")
                             absent_streaks.pop(symbol, None)
+                            changed = True
+                if changed:
+                    perfio.update_ledger(self.EXCHANGE_ID, self._open_trades)
+
+                perfio.update_snapshot(self.EXCHANGE_ID, positions_dict, account)
 
             except Exception as e:
                 print(f"  [trader] Monitor loop error: {e}")

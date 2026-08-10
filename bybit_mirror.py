@@ -48,16 +48,14 @@ Run by run_bot.py in parallel with trader.py's Binance loop — never standalone
 for trading, though `python bybit_mirror.py` runs just the monitor loop.
 """
 
-import csv
-import json
 import threading
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 import ccxt
 
 import config
+import perfio
 
 
 class BybitMirror:
@@ -94,14 +92,19 @@ class BybitMirror:
         # apply to Bybit.)
         self._http_lock = threading.Lock()
 
+        # Open trades tracked for reporting/PnL, restored from the persistent
+        # ledger so a restart never orphans a live Bybit position.
         self._open_trades: dict = {}   # raw symbol -> trade meta dict
+        ledger = perfio.load_ledger()
+        self._open_trades.update(ledger.get(self.EXCHANGE_ID, {}))
+
         self._pending_entries: dict = {}   # order_id -> rec (see execute_trade)
         self._pending_lock = threading.Lock()
         self._follower_thread = threading.Thread(
             target=self._entry_follower_loop, daemon=True)
         self._follower_thread.start()
 
-        self._init_performance_csv()
+        perfio.ensure_perf_header()
         print(f"  [bybit] BybitMirror ready — demo={config.BYBIT_TESTNET} "
               f"risk/trade=${config.BYBIT_RISK_PER_TRADE_USD:.0f} "
               f"lev={config.BYBIT_LEVERAGE}x "
@@ -172,6 +175,54 @@ class BybitMirror:
         except Exception as e:
             print(f"  [bybit] Error fetching positions: {e}")
             return []
+
+    def fetch_account_state(self) -> dict | None:
+        """Exchange-reported account state for PnL verification. Bybit's
+        fetch_balance() discards the raw wallet fields, so this hits
+        /v5/account/wallet-balance directly (UNIFIED, falling back to CONTRACT).
+        totalWalletBalance = realized wallet, totalMarginBalance = equity
+        (wallet + unrealized), totalPerpUPL = unrealized perp PnL. Best-effort:
+        returns None on any failure so the monitor never blocks on it."""
+        try:
+            raw = None
+            for acc_type in ("UNIFIED", "CONTRACT"):
+                try:
+                    raw = self._guarded(
+                        self.exchange.privateGetV5AccountWalletBalance,
+                        {"accountType": acc_type},
+                    )
+                    break
+                except Exception as e:
+                    if acc_type == "CONTRACT":
+                        raise e
+            row = (((raw or {}).get("result") or {}).get("list") or [{}])[0]
+
+            def f(*keys):
+                for k in keys:
+                    v = row.get(k)
+                    if v not in (None, ""):
+                        try:
+                            return float(v)
+                        except (TypeError, ValueError):
+                            pass
+                return None
+
+            wallet = f("totalWalletBalance")
+            equity = f("totalMarginBalance", "totalWalletBalance")
+            unrealized = f("totalPerpUPL")
+            available = f("totalAvailableBalance")
+            if wallet is None:
+                return None
+            return {
+                "wallet": wallet,
+                "unrealized": unrealized,
+                "equity": equity,
+                "available": available,
+                "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+        except Exception as e:
+            print(f"  [bybit] Account state fetch failed: {e}")
+            return None
 
     def pending_entry_count(self) -> int:
         with self._pending_lock:
@@ -434,54 +485,55 @@ class BybitMirror:
         rec["event"].set()
 
     # ── Monitoring / performance logging ───────────────────────────────────
-    def _init_performance_csv(self):
-        csv_path = Path(config.PERFORMANCE_CSV)
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Same file + schema as trader.py so performance_plot.py sees both
-        # exchanges in one equity view. If a legacy file without the exchange
-        # column exists, rewrite the header so columns never misalign.
-        needs_header = not csv_path.exists()
-        if not needs_header:
-            with open(csv_path, "r", encoding="utf-8") as f:
-                header = f.readline().strip()
-            if header and "exchange" not in header:
-                needs_header = True
-        if needs_header:
-            with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f, quoting=csv.QUOTE_MINIMAL).writerow([
-                    "timestamp_utc", "symbol", "direction", "qty", "entry",
-                    "sl", "tp", "mark_price", "unrealized_pnl", "status", "exchange",
-                ])
+    # All CSV/log/state writes go through perfio (single-writer, serialized
+    # with the Binance monitor in the same process).
 
     def _log_performance_row(self, symbol, direction, qty, entry, sl, tp,
                              mark_price, pnl, status):
-        csv_path = Path(config.PERFORMANCE_CSV)
-        with open(csv_path, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f, quoting=csv.QUOTE_MINIMAL).writerow([
-                datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                symbol, direction, qty, entry, sl, tp, mark_price, pnl, status,
-                self.EXCHANGE_ID,
-            ])
+        perfio.append_perf_row([
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            symbol, direction, qty, entry, sl, tp, mark_price, pnl, status,
+            self.EXCHANGE_ID,
+        ])
 
     def _log_trade_event(self, record: dict):
         record["exchange"] = self.EXCHANGE_ID
         record["time"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        log_path = Path(config.TRADE_LOG_FILE)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, default=str) + "\n")
+        perfio.append_log_event(record)
+
+    def _adopt_position(self, symbol, pos, contracts, side) -> dict:
+        """A position exists on Bybit that isn't in the ledger (opened before a
+        restart, or never tracked). Build best-effort meta and adopt it so it
+        gets a real close path instead of a forever-"open" ghost row."""
+        meta = {
+            "symbol": symbol,
+            "direction": "long" if str(side).lower() == "buy" or contracts > 0 else "short",
+            "qty": abs(contracts),
+            "entry": float(pos.get("entryPrice") or 0),
+            "sl": "",
+            "tp": "",
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+            "adopted": True,
+        }
+        self._open_trades[symbol] = meta
+        self._log_trade_event({"event": "adopted_position", **meta})
+        perfio.update_ledger(self.EXCHANGE_ID, self._open_trades)
+        print(f"  [bybit] Adopted untracked position: {symbol} "
+              f"{meta['direction']} qty={meta['qty']}")
+        return meta
 
     def monitor_loop(self):
-        """Run forever: poll Bybit open positions, log PnL, detect closes.
-        Positions are only declared closed after they've been absent for
-        BYBIT_POSITION_CLOSED_CONFIRM_POLLS consecutive polls — the same
-        confirm-streak logic trader.py uses on Binance."""
+        """Run forever: poll Bybit open positions, log PnL, detect closes,
+        snapshot. Same exchange-truth design as trader.py — every position is
+        adopted so it gets a close row, closed rows carry final mark/PnL, and
+        snapshot.json is rewritten every poll for the dashboard."""
         print("  [bybit] Monitor loop started.")
         absent_streaks: dict[str, int] = {}
         while True:
             try:
                 positions = self.get_open_positions()
+                account = self.fetch_account_state()
+                positions_dict = {}
                 open_symbols = set()
                 for pos in positions:
                     raw_symbol = (pos.get("info") or {}).get("symbol")
@@ -490,25 +542,31 @@ class BybitMirror:
                         symbol = symbol.replace("/", "").split(":")[0]
                     open_symbols.add(symbol)
                     contracts = float(pos.get("contracts") or 0)
-                    meta = self._open_trades.get(symbol)
-                    if meta:
-                        absent_streaks[symbol] = 0
-                        self._log_performance_row(
-                            meta["symbol"], meta["direction"], meta["qty"], meta["entry"],
-                            meta["sl"], meta["tp"],
-                            float(pos.get("markPrice") or 0),
-                            float(pos.get("unrealizedPnl") or 0), "open",
-                        )
-                    else:
-                        side = pos.get("side")
-                        direction = "long" if str(side).lower() == "buy" or contracts > 0 else "short"
-                        self._log_performance_row(
-                            symbol, direction, abs(contracts),
-                            float(pos.get("entryPrice") or 0),
-                            "", "", float(pos.get("markPrice") or 0),
-                            float(pos.get("unrealizedPnl") or 0), "open",
-                        )
+                    mark = float(pos.get("markPrice") or 0)
+                    pnl = float(pos.get("unrealizedPnl") or 0)
+                    side = pos.get("side")
 
+                    meta = self._open_trades.get(symbol)
+                    if meta is None:
+                        meta = self._adopt_position(symbol, pos, contracts, side)
+                    else:
+                        absent_streaks[symbol] = 0
+                    meta["last_mark"] = mark
+                    meta["last_pnl"] = pnl
+                    self._open_trades[symbol] = meta
+
+                    self._log_performance_row(
+                        meta["symbol"], meta["direction"], meta["qty"], meta["entry"],
+                        meta["sl"], meta["tp"], mark, pnl, "open",
+                    )
+                    positions_dict[symbol] = {
+                        "symbol": meta["symbol"], "direction": meta["direction"],
+                        "qty": meta["qty"], "entry": meta["entry"],
+                        "sl": meta["sl"], "tp": meta["tp"],
+                        "mark": mark, "pnl": pnl, "opened_at": meta.get("opened_at", ""),
+                    }
+
+                changed = False
                 for symbol in list(self._open_trades.keys()):
                     if symbol not in open_symbols:
                         absent_streaks[symbol] = absent_streaks.get(symbol, 0) + 1
@@ -516,11 +574,17 @@ class BybitMirror:
                             meta = self._open_trades.pop(symbol)
                             self._log_performance_row(
                                 meta["symbol"], meta["direction"], meta["qty"], meta["entry"],
-                                meta["sl"], meta["tp"], "", "", "closed",
+                                meta["sl"], meta["tp"],
+                                meta.get("last_mark", ""), meta.get("last_pnl", ""), "closed",
                             )
                             self._log_trade_event({"event": "closed", **meta})
                             print(f"  [bybit] Position closed: {meta['symbol']}")
                             absent_streaks.pop(symbol, None)
+                            changed = True
+                if changed:
+                    perfio.update_ledger(self.EXCHANGE_ID, self._open_trades)
+
+                perfio.update_snapshot(self.EXCHANGE_ID, positions_dict, account)
 
             except Exception as e:
                 print(f"  [bybit] Monitor loop error: {e}")

@@ -5,13 +5,30 @@ Serves a tiny interactive page over HTTP showing, per exchange (binance /
 bybit): equity curve, realized / unrealized PnL, open positions, closed
 positions and recent activity. It is strictly observational:
 
-  - reads data/performance.csv and data/trade_log.jsonl READ-ONLY,
-  - tails only appended bytes (no full re-reads per poll),
+  - reads data/performance.csv, data/trade_log.jsonl and data/snapshot.json
+    READ-ONLY,
+  - tails only appended bytes (no full re-reads per poll), and detects when
+    maintenance.py rewrites performance.csv via os.replace (new inode) so it
+    re-reads from the top instead of trusting a stale offset,
   - a single background thread refreshes the snapshot; HTTP requests just
     serve the cached snapshot (no file I/O on the request path),
   - writes nothing, opens no sockets to exchanges.
 
-It therefore cannot clog or interfere with the pipeline.
+Reporting design:
+  - Open positions + unrealized PnL come from data/snapshot.json, written by
+    the monitors every poll from their exchange fetch_positions(). dash never
+    guesses "open" from CSV history, so a restart, an untracked position, or a
+    maintenance trim can never leave a phantom open trade on the page.
+  - Realized PnL comes from self-contained "closed" rows in performance.csv
+    (each carries its own final PnL), so it does not depend on dash having
+    seen the matching open rows.
+  - The equity curve replays performance.csv; "open" rows track unrealized PnL
+    and "closed" rows convert it to realized. An "open" row not updated within
+    OPEN_STALE_SECONDS is force-closed at its last PnL so a dead ghost cannot
+    inflate the curve forever — and the booking is rolled back if the position
+    reappears.
+  - Staleness is explicit: if snapshot.json is older than
+    SNAPSHOT_STALE_SECONDS the page shows a STALE banner.
 
 Usage:
     python dash.py            # then open http://127.0.0.1:8765
@@ -29,6 +46,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import config
+import perfio
 
 PERF_HEADER = [
     "timestamp_utc", "symbol", "direction", "qty", "entry", "sl", "tp",
@@ -46,8 +64,15 @@ class DataSource:
 
     def __init__(self):
         self._perf_pos = 0
+        self._perf_ino = None
         self._perf_header = False
         self._state = self._fresh_state()
+        self._snap_open = []            # open positions from snapshot.json
+        self._snap_unrealized = {"binance": 0.0, "bybit": 0.0}
+        self._snap_account = {}         # exchange -> account state from snapshot.json
+        self._snap_generated = None
+        self._snap_stale = True
+        self._snap_seen = False
         self._payload = b"{}"
         self._error = None
         self._lock = threading.Lock()
@@ -57,6 +82,7 @@ class DataSource:
             "realized": {"binance": 0.0, "bybit": 0.0},
             "open_by_exch": {"binance": 0.0, "bybit": 0.0},
             "open_trades": {},      # (ex, symbol, direction) -> trade dict
+            "undo_pnl": {},         # key -> amount force-closed; roll back on reopen
             "closed": [],           # recent closed trades
             "series": [],           # [epoch, binance_pnl, bybit_pnl]
         }
@@ -70,9 +96,18 @@ class DataSource:
         if not path.exists():
             return []
         size = os.path.getsize(path)
-        if size < self._perf_pos:
-            # File was rewritten/truncated (e.g. legacy-header migration):
-            # reset and re-read from the top.
+        try:
+            ino = os.stat(path).st_ino
+        except OSError:
+            return []
+        if self._perf_ino is None:
+            self._perf_ino = ino
+        if ino != self._perf_ino or size < self._perf_pos:
+            # maintenance.py rewrites the file via os.replace (new inode) and
+            # may trim rows, so byte offsets are meaningless: re-read from the
+            # top into a fresh state for a consistent equity curve.
+            print("[dash] performance.csv replaced/trimmed — re-reading from top.")
+            self._perf_ino = ino
             self._perf_pos = 0
             self._perf_header = False
             self._state = self._fresh_state()
@@ -152,16 +187,40 @@ class DataSource:
         key = (ex, symbol, direction, round(entry, 8))
 
         if status == "closed":
+            forced = st["undo_pnl"].pop(key, None)
             t = st["open_trades"].pop(key, None)
+            # A closed row is SELF-CONTAINED: prefer its own explicit PnL over
+            # the last tracked open PnL, so realized PnL does not depend on dash
+            # having seen the matching open rows.
+            explicit = (d.get("unrealized_pnl") or "").strip()
+            if explicit:
+                rpnl = float(explicit or 0)
+            elif t is not None:
+                rpnl = t["pnl"]
+            else:
+                rpnl = 0.0
             if t is not None:
-                st["realized"][ex] += t["pnl"]
                 st["open_by_exch"][ex] -= t["pnl"]
-                t["realized"] = t["pnl"]
-                t["closed_at"] = (d.get("timestamp_utc") or "").strip()
-                st["closed"].append(t)
-                if len(st["closed"]) > CLOSED_KEEP:
-                    st["closed"] = st["closed"][-CLOSED_KEEP:]
+            if forced is not None:
+                st["realized"][ex] -= forced["pnl"]
+            st["realized"][ex] += rpnl
+            st["closed"].append({
+                "exchange": ex, "symbol": symbol, "direction": direction,
+                "qty": qty, "entry": entry, "mark": mark,
+                "pnl": rpnl, "realized": rpnl,
+                "opened_at": t.get("opened_at", "") if t is not None
+                else (d.get("timestamp_utc") or "").strip(),
+                "closed_at": (d.get("timestamp_utc") or "").strip(),
+                "stale_closed": bool(forced),
+            })
+            if len(st["closed"]) > CLOSED_KEEP:
+                st["closed"] = st["closed"][-CLOSED_KEEP:]
         else:
+            forced = st["undo_pnl"].pop(key, None)
+            if forced is not None:
+                # A trade we force-closed as stale is actually still open:
+                # undo the forced booking so realized is not inflated.
+                st["realized"][ex] -= forced["pnl"]
             t = st["open_trades"].get(key)
             if t is None:
                 t = {
@@ -183,6 +242,71 @@ class DataSource:
             st["realized"]["bybit"] + st["open_by_exch"]["bybit"],
         ])
 
+    def _apply_staleness(self):
+        """Force-close CSV "open" trades not updated within OPEN_STALE_SECONDS
+        so a dead ghost (position closed while the monitor was down, no closed
+        row ever written) cannot inflate the equity curve forever. The booking
+        is kept in undo_pnl: if the position reappears it is rolled back, so
+        realized is never double-counted."""
+        st = self._state
+        now = time.time()
+        # Positions the exchange reports as genuinely open right now (snapshot)
+        # are never force-closed — a maintenance trim of old open rows must not
+        # look like a close and double-count their unrealized PnL as realized.
+        live = {(t.get("exchange"), t.get("symbol")) for t in self._snap_open}
+        for key, t in list(st["open_trades"].items()):
+            if now - t["last_ts"] <= config.OPEN_STALE_SECONDS:
+                continue
+            if (t["exchange"], t["symbol"]) in live:
+                continue
+            ex = t["exchange"]
+            st["realized"][ex] += t["pnl"]
+            st["open_by_exch"][ex] -= t["pnl"]
+            st["undo_pnl"][key] = {"pnl": t["pnl"]}
+            st["open_trades"].pop(key, None)
+            st["closed"].append({
+                "exchange": ex, "symbol": t["symbol"], "direction": t["direction"],
+                "qty": t["qty"], "entry": t["entry"], "mark": t["mark"],
+                "pnl": t["pnl"], "realized": t["pnl"],
+                "opened_at": t["opened_at"],
+                "closed_at": datetime.fromtimestamp(t["last_ts"], tz=timezone.utc
+                                                    ).isoformat(timespec="seconds"),
+                "stale_closed": True,
+            })
+            if len(st["closed"]) > CLOSED_KEEP:
+                st["closed"] = st["closed"][-CLOSED_KEEP:]
+        if len(st["undo_pnl"]) > 100:   # bound it
+            st["undo_pnl"] = dict(list(st["undo_pnl"].items())[-100:])
+
+    def _load_snapshot(self):
+        """Read snapshot.json (exchange truth for open positions + unrealized)."""
+        snap = perfio.read_snapshot()
+        now = time.time()
+        if not snap:
+            self._snap_seen = False
+            self._snap_stale = True
+            self._snap_generated = None
+            return
+        self._snap_seen = True
+        gen = self._parse_epoch((snap.get("generated") or "").strip())
+        self._snap_stale = gen is None or (now - gen) > config.SNAPSHOT_STALE_SECONDS
+        self._snap_generated = snap.get("generated")
+        self._snap_account = snap.get("account") or {}
+        open_list = []
+        unreal = {"binance": 0.0, "bybit": 0.0}
+        for ex in ("binance", "bybit"):
+            for sym, t in (snap.get(ex) or {}).items():
+                open_list.append({
+                    "exchange": ex, "symbol": t.get("symbol", sym),
+                    "direction": t.get("direction", ""),
+                    "qty": t.get("qty", ""), "entry": t.get("entry", ""),
+                    "mark": t.get("mark", ""), "pnl": t.get("pnl", 0),
+                    "opened_at": t.get("opened_at", ""),
+                })
+                unreal[ex] += float(t.get("pnl") or 0)
+        self._snap_open = open_list
+        self._snap_unrealized = unreal
+
     def refresh(self):
         """Incremental update: read new CSV lines + log tail, rebuild payload."""
         try:
@@ -198,6 +322,8 @@ class DataSource:
                     if len(row) < 11:
                         d["exchange"] = "binance"   # legacy rows: no exchange column
                     self._process_row(d)
+                self._load_snapshot()
+                self._apply_staleness()
                 self._payload = json.dumps(
                     self._build_payload(), default=str
                 ).encode("utf-8")
@@ -224,20 +350,26 @@ class DataSource:
             "binance": config.DASH_START_BALANCE_BINANCE,
             "bybit": config.DASH_START_BALANCE_BYBIT,
         }
+        # Unrealized PnL: snapshot.json is the exchange truth. Fall back to the
+        # CSV-replayed open PnL only when no snapshot has ever been seen.
+        unreal = dict(self._snap_unrealized if self._snap_seen else st["open_by_exch"])
         equity = {}
         for ex in ("binance", "bybit"):
-            equity[ex] = start[ex] + st["realized"][ex] + st["open_by_exch"][ex]
+            equity[ex] = start[ex] + st["realized"][ex] + unreal[ex]
         series = self._downsample(st["series"])
-        open_list = sorted(
-            st["open_trades"].values(), key=lambda t: t["first_ts"], reverse=True
-        )
+        open_list = list(self._snap_open)
         closed_list = list(reversed(st["closed"][-200:]))
+        verify = self._build_verify(start, st, unreal)
         return {
             "generated": datetime.now(timezone.utc).isoformat(),
             "start": start,
             "equity": equity,
             "realized": st["realized"],
-            "unrealized": st["open_by_exch"],
+            "unrealized": unreal,
+            "verify": verify,
+            "verify_tolerance": config.PNL_VERIFY_TOLERANCE_USD,
+            "stale": self._snap_stale,
+            "snapshot_generated": self._snap_generated or "",
             "first_pt": series[0] if series else None,
             "series": series,
             "open": open_list,
@@ -245,6 +377,45 @@ class DataSource:
             "activity": self._read_log_tail(),
             "error": self._error,
         }
+
+    def _build_verify(self, start: dict, st: dict, unreal: dict) -> dict:
+        """Compare dash's computed PnL against the exchange's own account
+        state (snapshotted by the monitors every poll):
+
+            exchange PnL  = exchange equity (margin balance) - starting balance
+            dash PnL      = realized (CSV closed rows) + unrealized (positions)
+
+        The delta is surfaced so a start-balance misconfig, an untracked
+        position, or a gap in the CSV never hides the mismatch. Only reported
+        for exchanges whose account state has actually been snapshotted."""
+        verify = {}
+        for ex in ("binance", "bybit"):
+            acc = self._snap_account.get(ex)
+            if not acc or not isinstance(acc, dict):
+                continue
+            exch_equity = acc.get("equity")
+            if exch_equity is None:
+                continue
+            exch_pnl = exch_equity - start[ex]
+            dash_pnl = st["realized"][ex] + unreal[ex]
+            delta = exch_pnl - dash_pnl
+            verify[ex] = {
+                "exchange_pnl": round(exch_pnl, 2),
+                "dash_pnl": round(dash_pnl, 2),
+                "delta": round(delta, 2),
+                "start_unset": start[ex] == 0,
+                "exchange_equity": round(exch_equity, 2),
+                "exchange_wallet": (round(acc["wallet"], 2)
+                                    if acc.get("wallet") is not None else None),
+                "exchange_unrealized": (round(acc["unrealized"], 2)
+                                        if acc.get("unrealized") is not None else None),
+                "dash_unrealized": round(unreal[ex], 2),
+                "dash_realized": round(st["realized"][ex], 2),
+                "start": start[ex],
+                "ok": abs(delta) <= config.PNL_VERIFY_TOLERANCE_USD,
+                "fetched_at": acc.get("fetched_at", ""),
+            }
+        return verify
 
     def payload(self):
         return self._payload
@@ -322,6 +493,12 @@ PAGE = r"""<!doctype html>
 <body>
 <h1>liq <span>· per-exchange equity &amp; performance</span></h1>
 
+<div id="stale" style="display:none;background:#ef535015;border:1px solid #ef5350;color:#ef5350;
+     border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px;">
+  STALE — snapshot.json is older than <span id="stale-sec"></span>s. Bot offline or
+  exchange unreachable. Open positions &amp; unrealized PnL show the last known state.
+</div>
+
 <div class="cards">
   <div class="card"><div class="ex" style="color:var(--bin)">Binance</div>
     <div class="val" id="eq-bin">—</div>
@@ -332,6 +509,12 @@ PAGE = r"""<!doctype html>
   <div class="card"><div class="ex">Combined</div>
     <div class="val" id="eq-tot">—</div>
     <div class="sub" id="sub-tot">binance + bybit</div></div>
+</div>
+
+<div class="panel">
+  <h2>PnL verification <span style="font-weight:400;font-size:12px;color:var(--dim)">
+    dash math vs exchange-reported account</span></h2>
+  <div id="verify"><span class="muted">waiting for exchange account snapshot…</span></div>
 </div>
 
 <div class="panel"><h2>Equity curve</h2><canvas id="chart"></canvas></div>
@@ -380,6 +563,10 @@ function drawChart(series){
 
 function render(d){
   const st=d.start||{}, eq=d.equity||{}, rz=d.realized||{}, un=d.unrealized||{};
+  const stale=d.stale;
+  if(stale){ E("stale").style.display="block";
+    E("stale-sec").textContent=Math.round((Date.now()-new Date(d.snapshot_generated||Date.now()))/1000)||"?";
+  } else { E("stale").style.display="none"; }
   const tot=eq.binance+eq.bybit;
   for(const k of ["binance","bybit"]){
     const v=eq[k]??0, s= k==="bybit"?"byb":"bin";
@@ -389,6 +576,28 @@ function render(d){
   }
   E("eq-tot").textContent=fmt(tot,2); E("eq-tot").className="val "+cls(tot-(st.binance||0)-(st.bybit||0));
   E("sub-tot").innerHTML=`start <b>${fmt((st.binance||0)+(st.bybit||0),0)}</b> · realized <b>${sym((rz.binance||0)+(rz.bybit||0))}${fmt((rz.binance||0)+(rz.bybit||0),2)}</b>`;
+
+    const vf=d.verify||{};
+  const vkeys=Object.keys(vf);
+  E("verify").innerHTML = vkeys.length?`<table>
+    <tr><th></th><th>Dash</th><th>Exchange</th><th>Δ (ex − dash)</th></tr>
+    ${vkeys.map(k=>{
+      const v=vf[k], ok=v.ok;
+      const badge=`<span class="lbl ${ok?"long":"short"}">${ok?"OK":"WARN"}</span>`;
+      const exPnlCell = v.start_unset
+        ? `<span class="muted">n/a — set DASH_START_BALANCE_*</span>`
+        : `${sym(v.exchange_pnl)}${fmt(v.exchange_pnl,2)}`;
+      const deltaCell = v.start_unset
+        ? `<span class="muted">n/a</span>`
+        : `${sym(v.delta)}${fmt(v.delta,2)}<div class="muted" style="font-size:11px">tolerance ±${fmt(d.verify_tolerance,0)}</div>`;
+      return `<tr><td>${exlbl(k)} ${badge}</td>
+        <td class="right">${sym(v.dash_pnl)}${fmt(v.dash_pnl,2)}<div class="muted" style="font-size:11px">real ${sym(v.dash_realized)}${fmt(v.dash_realized,2)} · unreal ${sym(v.dash_unrealized)}${fmt(v.dash_unrealized,2)}</div></td>
+        <td class="right">${exPnlCell}<div class="muted" style="font-size:11px">equity ${fmt(v.exchange_equity,2)} ${v.exchange_wallet!=null?`· wallet ${fmt(v.exchange_wallet,2)}`:""} · unreal ${v.exchange_unrealized!=null?fmt(v.exchange_unrealized,2):"—"}</div></td>
+        <td class="right ${cls(v.delta)}">${deltaCell}</td></tr>`;
+    }).join("")}</table>
+    <div class="muted" style="font-size:11px;margin-top:6px">exchange PnL = equity (margin balance) − starting balance. Set DASH_START_BALANCE_* to your real starting balances for an exact match; residual delta = fees/funding/exit-vs-last-mark + any position the bot isn't tracking.</div>`
+    :"<span class='muted'>waiting for exchange account snapshot…</span>";
+
 
   const fp=d.first_pt;
   if(fp){ const db=eq.binance-(st.binance||0)-fp[1], dy=eq.bybit-(st.bybit||0)-fp[2];
@@ -416,7 +625,7 @@ function render(d){
   }).join("");
   E("activity").innerHTML=rows_a||"<span class='muted'>none</span>";
 
-  E("foot").textContent=`snapshot ${d.generated}${d.error?" · refresh error: "+d.error:""} · open ${(d.open||[]).length} · closed ${(d.closed||[]).length} · series ${(d.series||[]).length}pts`;
+  E("foot").textContent=`snapshot ${d.generated}${d.error?" · refresh error: "+d.error:""} · open ${(d.open||[]).length} · closed ${(d.closed||[]).length} · series ${(d.series||[]).length}pts${d.stale?" · STALE":""}`;
 }
 
 async function poll(){

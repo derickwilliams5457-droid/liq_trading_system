@@ -30,6 +30,11 @@ LIQ_BUCKET_STATE  = DATA_DIR / "liq_bucket_state.json"      # per-symbol streak 
 LIQ_SIGNALS_FILE  = DATA_DIR / "liq_signals.jsonl"          # written by liq_bucket.py, tailed by run_bot.py
 TRADE_LOG_FILE    = DATA_DIR / "trade_log.jsonl"            # every decision + execution, for audit/debug
 PERFORMANCE_CSV   = DATA_DIR / "performance.csv"            # written by trader.py, read by performance_plot.py
+# Open-trade ledger + live snapshot (see perfio.py). The ledger survives
+# restarts so a position is never orphaned; the snapshot is the exchange truth
+# the dashboard's "open positions" reads — never CSV history inference.
+TRADES_LEDGER_FILE = DATA_DIR / "trades.json"               # per-exchange open-trade metadata
+SNAPSHOT_FILE      = DATA_DIR / "snapshot.json"             # live open positions + PnL, rewritten every monitor poll
 
 # ── Liquidation stream (liq_stream.py) ───────────────────────────────────────
 WS_URL       = "wss://fstream.binance.com/market/ws/!forceOrder@arr"
@@ -225,6 +230,12 @@ MAX_CONCURRENT_POSITIONS = 3     # multiple positions open at a time (multi-coin
 # AND its fill window has already expired, the order is abandoned instead of
 # reprinting the error every second forever.
 MAX_POLL_FAILURES = 3
+# If TP/SL attachment keeps failing for a filled LIMIT entry with transient
+# errors, stop retrying after this many polls instead of reprinting oco_failed
+# every second forever. Permanent errors abandon immediately: -4509 (no open
+# position behind the fill) and -4130 (the closePosition order already exists —
+# treated as already attached, not a failure).
+MAX_TP_SL_ATTACH_ATTEMPTS = 10
 
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
@@ -278,6 +289,20 @@ DASH_REFRESH_SECONDS = float(os.getenv("DASH_REFRESH_SECONDS", "2"))
 # balances for true equity figures.
 DASH_START_BALANCE_BINANCE = float(os.getenv("DASH_START_BALANCE_BINANCE", "0"))
 DASH_START_BALANCE_BYBIT = float(os.getenv("DASH_START_BALANCE_BYBIT", "0"))
+# A live snapshot is written by every monitor poll (5s). If snapshot.json is
+# older than this, the bot is offline / the exchange is unreachable — the
+# dashboard shows a "stale" banner instead of pretending nothing is open.
+SNAPSHOT_STALE_SECONDS = float(os.getenv("SNAPSHOT_STALE_SECONDS", "30"))
+# An "open" row in performance.csv not updated for this long is treated by the
+# dashboard as dead (force-closed at its last PnL). Guards against ghost trades
+# that never got a "closed" row (restart gaps, untracked positions).
+OPEN_STALE_SECONDS = float(os.getenv("OPEN_STALE_SECONDS", "120"))
+# PnL verification: every monitor poll also snapshots the exchange's OWN account
+# state (equity / wallet / unrealized PnL). The dashboard compares its computed
+# PnL (= realized + unrealized) against the exchange's (equity - starting
+# balance) and flags the delta when it exceeds this tolerance in either
+# direction. Start balances above must be set for the comparison to be exact.
+PNL_VERIFY_TOLERANCE_USD = float(os.getenv("PNL_VERIFY_TOLERANCE_USD", "5"))
 
 # ── Data retention (maintenance.py) ────────────────────────────────────────────
 # Three files grow without bound and on a small cloud disk they eventually fill
