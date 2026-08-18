@@ -4,20 +4,18 @@ ratelimit.py  —  Global one-at-a-time gate + weight bucket + ban state
 Binance futures caps the ENTIRE IP at 2400 request-weight per minute (and bans
 the IP with a 418 "I'm a teapot" when exceeded — see the "Way too many
 requests" error). Multiple modules hit the same IP from this process:
-hratmap's aggTrades pagination (weight 20 each), warm-up precomputes,
-strategy's OHLCV fetches, and the trader's position/order polls. Left
-unthrottled they burst past the cap in seconds, get the bot 418-banned, and
-then — worst of all — keep RETRYING into the active ban, which makes Binance
-extend the ban for many more minutes (that is what turned a normal ban into a
-25+ minute outage).
+strategy's OHLCV fetches, the trader's position/order polls, and balance
+checks. Left unthrottled they burst past the cap in seconds, get the bot
+418-banned, and then — worst of all — keep RETRYING into the active ban,
+which makes Binance extend the ban for many more minutes (that is what turned
+a normal ban into a 25+ minute outage).
 
 This module fixes all three failure modes with ONE shared choke point:
 
 1. SERIALIZED — every Binance REST call in the process goes through the
    global `_HTTP_LOCK`, so the bot polls strictly ONE request at a time.
-   Parallel aggTrades slices, the warmer, the trigger path and the trader's
-   monitor/follower all queue on the same lock instead of hammering Binance
-   concurrently.
+   Strategy candle fetches, trigger path and the trader's monitor/follower
+   all queue on the same lock instead of hammering Binance concurrently.
 
 2. WEIGHT BUCKET — `acquire(weight)` refills continuously (capacity =
    RATE_LIMIT_WEIGHT_PER_MIN tokens, refill = capacity/60 per second) so the
@@ -34,10 +32,9 @@ All three guarantees are exported through a single helper:
 
     data = ratelimit.request("GET", url, params=..., weight=...)
 
-which is what hratmap.py uses for every REST call. ccxt callers (strategy,
-trader) must instead wrap their call in `with ratelimit.serialized():` and
-call `ratelimit.fail_fast_if_banned()` first so they share the same lock and
-ban state.
+ccxt callers (strategy, trader) must instead wrap their call in
+`with ratelimit.serialized():` and call `ratelimit.fail_fast_if_banned()`
+first so they share the same lock and ban state.
 """
 
 import re

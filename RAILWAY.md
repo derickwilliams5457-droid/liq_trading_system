@@ -96,8 +96,8 @@ public, put it behind a Railway-provided service or an auth proxy.
 
 | Concern | Answer |
 |---|---|
-| Where state lives | In the volume mounted at `/data` (`liquidations.csv`, `liq_bucket_state.json`, `liq_signals.jsonl`, `trade_log.jsonl`, `performance.csv`) |
-| What persists | The volume survives deploys, restarts, and rebuilds. Bucket streak counters, the trade log, and performance history all carry over |
+| Where state lives | In the volume mounted at `/data` (`liquidations.csv`, `liq_bucket_state.json`, `liq_signals.jsonl`, `trade_log.jsonl`, `performance.csv`, `trades.json`, `snapshot.json`) |
+| What persists | The volume survives deploys, restarts, and rebuilds. Bucket streak counters, the trade log, performance history, and the open-trade ledger all carry over |
 | What does NOT persist | The container's own filesystem outside `/data` (source, pyc caches, temp files) — rebuilt each deploy |
 | Disk usage | `maintenance.py` trims the three unbounded files to `MAX_LIQ_CSV_ROWS` / `MAX_PERFORMANCE_ROWS` / `MAX_TRADE_LOG_LINES` (defaults 250k / 50k / 50k rows) hourly |
 | Not persisted (by design) | `liq_signals.jsonl` is never trimmed (run_bot tails it live); it grows ~1 MB/day — delete it manually if it ever matters |
@@ -124,6 +124,33 @@ and redeploy — the bot starts clean with empty bucket counters.
   safe.
 - Binance IP bans are handled in-process by `ratelimit.py` (fail-fast, no
   polling into a ban) — a ban pauses that process only.
+- Entry orders use **Binance user data WebSocket** for instant fill
+  notifications (no REST polling). A cancel timer handles unfilled order
+  timeouts. The same pattern applies to Bybit via its private v5 WebSocket.
 - Time: Binance rejects requests with a skewed client clock. Railway's NTP
   is normally fine; if you ever see timestamp errors, that's the first thing
   to check.
+
+## 8. Architecture overview
+
+```
+liq_stream.py  ──→  liquidations.csv
+                         ↓
+liq_bucket.py   ──→  liq_signals.jsonl
+                         ↓
+run_bot.py      ──→  strategy.decide_direction()
+                         ↓
+              ┌─────────────────────┐
+              │  trader.py (Binance)│  ←── Binance user data WebSocket
+              │  bybit_mirror.py    │  ←── Bybit v5 private WebSocket
+              └─────────────────────┘
+                         ↓
+              performance.csv / trade_log.jsonl / trades.json / snapshot.json
+                         ↓
+              dash.py (read-only dashboard)
+```
+
+All entry orders are LIMIT orders priced at the interest candle's exact close.
+Both exchanges use private WebSockets for instant fill notifications — no
+REST polling. SL and TP are both derived from the Dynamic ATR (6-candle
+window), giving a ~1:1 R:R by construction.

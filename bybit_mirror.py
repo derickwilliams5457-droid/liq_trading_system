@@ -2,7 +2,7 @@
 bybit_mirror.py  —  Bybit execution adapter ("the mirror")
 =============================================================
 Takes every trade decision the pipeline produces (the `levels` dict that
-strategy.py / allocation.py / hratmap.py build and run_bot.py finalizes) and
+strategy.py / allocation.py build and run_bot.py finalizes) and
 re-executes it on Bybit, translated for the price difference between the two
 exchanges.
 
@@ -39,8 +39,8 @@ Execution model (mirrors trader.py exactly):
     - TP/SL are attached natively on the Bybit order itself (ccxt sends them to
       Bybit's trading-stop endpoint), so no separate attach-on-fill step is
       needed — unlike Binance USD-M which carries no TP/SL on a limit order.
-    - An entry follower thread polls every resting LIMIT until it fills (then
-      tracks the position) or its fill window expires (then cancels it).
+    - A private WebSocket (Bybit v5 private stream) pushes order fill events
+      instantly. A cancel timer handles unfilled order timeouts.
     - A monitor loop polls open positions, logs PnL rows to
       config.PERFORMANCE_CSV (tagged exchange="bybit"), and records closes.
 
@@ -48,6 +48,9 @@ Run by run_bot.py in parallel with trader.py's Binance loop — never standalone
 for trading, though `python bybit_mirror.py` runs just the monitor loop.
 """
 
+import hashlib
+import hmac
+import json
 import threading
 import time
 from datetime import datetime, timezone
@@ -100,9 +103,12 @@ class BybitMirror:
 
         self._pending_entries: dict = {}   # order_id -> rec (see execute_trade)
         self._pending_lock = threading.Lock()
-        self._follower_thread = threading.Thread(
-            target=self._entry_follower_loop, daemon=True)
-        self._follower_thread.start()
+        self._ws_thread = threading.Thread(
+            target=self._user_data_stream_loop, daemon=True)
+        self._ws_thread.start()
+        self._cancel_thread = threading.Thread(
+            target=self._cancel_timer_loop, daemon=True)
+        self._cancel_thread.start()
 
         perfio.ensure_perf_header()
         print(f"  [bybit] BybitMirror ready — demo={config.BYBIT_TESTNET} "
@@ -295,7 +301,7 @@ class BybitMirror:
 
     # ── Execution ──────────────────────────────────────────────────────────
     def execute_trade(self, levels: dict, deadline_ts: float | None = None,
-                      wait_for_fill: bool = True):
+                      wait_for_fill: bool = True, candle_open_ts: float | None = None):
         """Mirror a Binance `levels` dict onto Bybit. Same contract as
         Trader.execute_trade so run_bot.py drives both adapters identically:
 
@@ -317,12 +323,6 @@ class BybitMirror:
         if self.has_open_position():
             print(f"  [bybit] Skipping {levels['symbol']} — Bybit capacity full "
                   f"({self.open_capacity_used()}/{config.BYBIT_MAX_CONCURRENT_POSITIONS}).")
-            return None
-
-        rr = levels.get("risk_reward")
-        if rr is None or rr < config.MIN_RISK_REWARD:
-            print(f"  [bybit] Skipping {levels['symbol']} — R:R {rr} below "
-                  f"MIN_RISK_REWARD ({config.MIN_RISK_REWARD}).")
             return None
 
         symbol = levels["symbol"]
@@ -417,7 +417,9 @@ class BybitMirror:
             "levels": tlevels,
             "deadline_ts": deadline_ts,
             "placed_at": time.time(),
-            "cancel_at": time.time() + config.BYBIT_LIMIT_FILL_WINDOW_SECONDS,
+            "cancel_at": (candle_open_ts + config.BYBIT_LIMIT_FILL_WINDOW_SECONDS
+                          if candle_open_ts is not None
+                          else time.time() + config.BYBIT_LIMIT_FILL_WINDOW_SECONDS),
             "cancel_attempted": False,
             "attached": True,          # TP/SL ride on the order itself
             "resolved": False,
@@ -442,75 +444,137 @@ class BybitMirror:
             return None
         return entry_order if rec["filled"] else None
 
-    # ── Entry follower ─────────────────────────────────────────────────────
-    def _entry_follower_loop(self):
-        """Daemon: watch every resting Bybit LIMIT entry until it fills (then
-        track the position) or its fill window expires (then cancel it)."""
+    # ── Entry follower (WebSocket-based) ──────────────────────────────────
+    def _user_data_stream_loop(self):
+        """Daemon: maintain a Bybit v5 private WebSocket for instant order fill
+        notifications. Reconnects automatically on disconnects."""
+        import websocket
+
         while True:
             try:
-                with self._pending_lock:
-                    recs = list(self._pending_entries.values())
-                for rec in recs:
-                    self._poll_pending_entry(rec)
+                expires = int((time.time() + 10) * 1000)
+                signature_val = hmac.new(
+                    config.BYBIT_API_SECRET.strip().encode("utf-8"),
+                    f"GET/realtime{expires}".encode("utf-8"),
+                    hashlib.sha256,
+                ).hexdigest()
+
+                if config.BYBIT_TESTNET:
+                    ws_url = "wss://stream-testnet.bybit.com/v5/private"
+                else:
+                    ws_url = "wss://stream.bybit.com/v5/private"
+
+                print(f"  [bybit] Connecting private WebSocket...")
+
+                def on_message(ws, message):
+                    try:
+                        data = json.loads(message)
+                        topic = data.get("topic", "")
+                        msg_type = data.get("type", "")
+                        if topic == "order" and msg_type == "snapshot":
+                            for order in data.get("data", []):
+                                self._handle_order_update(order)
+                    except Exception as e:
+                        print(f"  [bybit] WS message error: {e}")
+
+                def on_error(ws, error):
+                    print(f"  [bybit] WS error: {error}")
+
+                def on_close(ws, close_status_code, close_msg):
+                    print(f"  [bybit] WS closed ({close_status_code}: {close_msg})")
+
+                def on_open(ws):
+                    # Authenticate
+                    auth_msg = json.dumps({
+                        "op": "auth",
+                        "args": [config.BYBIT_API_KEY.strip(), expires, signature_val],
+                    })
+                    ws.send(auth_msg)
+                    # Subscribe to order updates
+                    sub_msg = json.dumps({
+                        "op": "subscribe",
+                        "args": ["order"],
+                    })
+                    ws.send(sub_msg)
+                    print(f"  [bybit] Private WebSocket connected + subscribed")
+
+                ws = websocket.WebSocketApp(
+                    ws_url,
+                    on_message=on_message,
+                    on_error=on_error,
+                    on_close=on_close,
+                    on_open=on_open,
+                )
+
+                ws_thread = threading.Thread(target=ws.run_forever, kwargs={
+                    "ping_interval": 20,
+                    "ping_timeout": 10,
+                }, daemon=True)
+                ws_thread.start()
+
+                while ws_thread.is_alive():
+                    time.sleep(5)
+
+                ws.close()
+                print(f"  [bybit] Private WebSocket disconnected, reconnecting...")
+
             except Exception as e:
-                print(f"  [bybit] Entry follower error: {e}")
-            time.sleep(config.BYBIT_ORDER_POLL_SECONDS)
+                print(f"  [bybit] WebSocket error: {e}")
+                time.sleep(5)
 
-    def _poll_pending_entry(self, rec):
-        if rec.get("resolved"):
-            return
-        if time.time() > rec["cancel_at"] and not rec["cancel_attempted"]:
-            rec["cancel_attempted"] = True
-            try:
-                self._guarded(self.exchange.cancel_order, rec["order_id"], rec["unified"])
-            except Exception as e:
-                print(f"  [bybit] Could not cancel unfilled LIMIT entry for "
-                      f"{rec['symbol']}: {e}")
+    def _handle_order_update(self, order: dict):
+        """Process an order update from the Bybit private WebSocket.
+        On fill, finalize. On cancel/expired, finalize as failed."""
+        order_id = str(order.get("orderId", ""))
+        status = order.get("orderStatus", "")
+        cum_exec_qty = float(order.get("cumExecQty", 0))
 
-        try:
-            order = self._guarded(
-                self.exchange.fetch_order, rec["order_id"], rec["unified"],
-                params={"acknowledged": True},
-            )
-        except Exception as e:
-            rec["poll_failures"] = rec.get("poll_failures", 0) + 1
-            # Without params["acknowledged"]=True, a Unified-account fetchOrder
-            # ALWAYS raises this "last 500 orders" error — so it MUST be passed.
-            # If polling still fails after the fill window has expired (the order
-            # id is genuinely unreachable), abandon instead of reprinting the
-            # same error every poll forever.
-            if rec["poll_failures"] >= config.BYBIT_MAX_POLL_FAILURES and time.time() > rec["cancel_at"]:
-                print(f"  [bybit] Could not poll fill status for {rec['symbol']} after "
-                      f"{rec['poll_failures']} attempts ({type(e).__name__}); fill window "
-                      f"expired — abandoning.")
-                self._finalize_failed(rec, "unresolvable")
-            else:
-                print(f"  [bybit] Could not poll fill status for {rec['symbol']}: {e}")
+        if not order_id:
             return
 
-        status = order.get("status")
-        filled_qty = float(order.get("filled") or 0)
-        if status == "closed" or filled_qty > 0:
-            # 'filled_qty > 0' on a canceled/expired status = the cancel raced a
-            # fill (or a partial fill happened before the rest was canceled):
-            # Bybit is ALREADY holding the position, so track + manage it —
-            # never orphan it. Bybit's TP/SL ride on the order (trading-stop
-            # endpoint), so they carry over to the filled position automatically.
+        with self._pending_lock:
+            rec = self._pending_entries.get(order_id)
+        if not rec or rec.get("resolved"):
+            return
+
+        if status == "Filled" or cum_exec_qty > 0:
             if not rec.get("filled"):
                 rec["filled"] = True
                 rec["meta"] = {
                     **rec["levels"],
-                    "qty": filled_qty if filled_qty > 0 else rec["qty"],
+                    "qty": cum_exec_qty if cum_exec_qty > 0 else rec["qty"],
                     "opened_at": datetime.now(timezone.utc).isoformat(),
                 }
                 self._open_trades[rec["symbol"]] = rec["meta"]
                 rec["event"].set()
                 print(f"  [bybit] Filled {rec['direction'].upper()} {rec['symbol']} "
                       f"qty={rec['meta']['qty']} entry={rec['entry_price']}"
-                      f" (status={status}, filled={filled_qty})")
+                      f" (WS fill, status={status}, filled={cum_exec_qty})")
             self._finalize_filled(rec)
-        elif status in ("canceled", "expired", "rejected", "failed"):
-            self._finalize_failed(rec, status)
+        elif status in ("Cancelled", "Expired", "Rejected", "Failed"):
+            self._finalize_failed(rec, status.lower())
+
+    def _cancel_timer_loop(self):
+        """Daemon: cancel unfilled Bybit LIMIT entries when their fill window
+        expires. Runs independently of the WebSocket."""
+        while True:
+            try:
+                with self._pending_lock:
+                    recs = list(self._pending_entries.values())
+                for rec in recs:
+                    if rec.get("resolved"):
+                        continue
+                    if time.time() > rec["cancel_at"] and not rec["cancel_attempted"]:
+                        rec["cancel_attempted"] = True
+                        try:
+                            self._guarded(self.exchange.cancel_order,
+                                          rec["order_id"], rec["unified"])
+                        except Exception as e:
+                            print(f"  [bybit] Could not cancel unfilled LIMIT entry for "
+                                  f"{rec['symbol']}: {e}")
+            except Exception as e:
+                print(f"  [bybit] Cancel timer error: {e}")
+            time.sleep(1)
 
     def _finalize_filled(self, rec):
         with self._pending_lock:

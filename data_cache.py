@@ -1,23 +1,22 @@
 """
 data_cache.py  —  Small TTL cache with provenance tags + single-flight dedup
-=============================================================================
+============================================================================
 The same market data is needed by several modules at once (strategy's 3m
-candles, hratmap's 3m candles for the zone rays, price precision, zone
-results). Without a shared cache every consumer does its own Binance call for
-the same data — which is exactly what blew past the IP weight budget and got
-the bot 418-banned during the signal influx.
+candles, price precision). Without a shared cache every consumer does its own
+Binance call for the same data — which is exactly what blew past the IP
+weight budget and got the bot 418-banned during the signal influx.
 
-Every entry carries a `tag` (e.g. "klines:3m", "pricePrecision",
-"zones:hratmap") so any log/reader can see at a glance which piece of data a
-hit came from and which module produced it. Entries expire on a TTL as a
-safety net; run_bot.py additionally evicts the per-symbol entries after the
-final verdict so the cache never clogs up with stale candles/zones.
+Every entry carries a `tag` (e.g. "klines:3m", "pricePrecision") so any
+log/reader can see at a glance which piece of data a hit came from and which
+module produced it. Entries expire on a TTL as a safety net; run_bot.py
+additionally evicts the per-symbol entries after the final verdict so the
+cache never clogs up with stale candles.
 
 get_or_fetch() is "single-flight": if two threads need the same key at once
-(which is the normal case here — the hratmap zone thread and the strategy
-vote run in parallel), only one of them performs the network fetch and the
-other waits and reuses the result. The waiting thread NEVER issues its own
-duplicate Binance call.
+(which is the normal case — the strategy vote and candle fetch may run in
+parallel), only one of them performs the network fetch and the other waits
+and reuses the result. The waiting thread NEVER issues its own duplicate
+Binance call.
 """
 
 import threading

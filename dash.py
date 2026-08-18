@@ -350,8 +350,6 @@ class DataSource:
             "binance": config.DASH_START_BALANCE_BINANCE,
             "bybit": config.DASH_START_BALANCE_BYBIT,
         }
-        # Unrealized PnL: snapshot.json is the exchange truth. Fall back to the
-        # CSV-replayed open PnL only when no snapshot has ever been seen.
         unreal = dict(self._snap_unrealized if self._snap_seen else st["open_by_exch"])
         equity = {}
         for ex in ("binance", "bybit"):
@@ -360,6 +358,7 @@ class DataSource:
         open_list = list(self._snap_open)
         closed_list = list(reversed(st["closed"][-200:]))
         verify = self._build_verify(start, st, unreal)
+        metrics = self._compute_metrics(st, series, start, equity)
         return {
             "generated": datetime.now(timezone.utc).isoformat(),
             "start": start,
@@ -374,8 +373,66 @@ class DataSource:
             "series": series,
             "open": open_list,
             "closed": closed_list,
+            "metrics": metrics,
             "activity": self._read_log_tail(),
             "error": self._error,
+        }
+
+    def _compute_metrics(self, st, series, start, equity):
+        """Compute win rate, avg win/loss, max drawdown, profit factor from
+        closed trades and equity series."""
+        closed = st["closed"]
+        total = len(closed)
+        if total == 0:
+            return {
+                "total_trades": 0, "wins": 0, "losses": 0,
+                "win_rate": 0, "avg_win": 0, "avg_loss": 0,
+                "profit_factor": 0, "max_drawdown": 0, "max_dd_pct": 0,
+                "best_trade": 0, "worst_trade": 0, "expectancy": 0,
+                "total_pnl": 0,
+            }
+        pnls = [t["pnl"] for t in closed]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        total_pnl = sum(pnls)
+        avg_win = sum(wins) / len(wins) if wins else 0
+        avg_loss = sum(losses) / len(losses) if losses else 0
+        gross_profit = sum(wins) if wins else 0
+        gross_loss = abs(sum(losses)) if losses else 0
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else (999.0 if gross_profit > 0 else 0)
+        win_rate = len(wins) / total * 100 if total else 0
+        # Expectancy: avg $ gained per trade
+        expectancy = total_pnl / total if total else 0
+
+        # Max drawdown from equity series
+        max_dd = 0.0
+        max_dd_pct = 0.0
+        peak = 0.0
+        for pt in series:
+            val = pt[1] + pt[2]  # combined equity
+            total_start = (start.get("binance") or 0) + (start.get("bybit") or 0)
+            eq = val + total_start
+            if eq > peak:
+                peak = eq
+            dd = peak - eq
+            if dd > max_dd:
+                max_dd = dd
+                max_dd_pct = (dd / peak * 100) if peak > 0 else 0
+
+        return {
+            "total_trades": total,
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round(win_rate, 1),
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
+            "profit_factor": round(profit_factor, 2),
+            "max_drawdown": round(max_dd, 2),
+            "max_dd_pct": round(max_dd_pct, 1),
+            "best_trade": round(max(pnls), 2) if pnls else 0,
+            "worst_trade": round(min(pnls), 2) if pnls else 0,
+            "expectancy": round(expectancy, 2),
+            "total_pnl": round(total_pnl, 2),
         }
 
     def _build_verify(self, start: dict, st: dict, unreal: dict) -> dict:
@@ -460,71 +517,99 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <title>liq — exchange dashboard</title>
 <style>
-  :root{--bg:#0f1115;--panel:#171a21;--line:#2a2e38;--txt:#e6e6e6;--dim:#8b93a5;
-        --bin:#00b4ff;--byb:#ff8c1a;--pos:#26a69a;--neg:#ef5350;}
+  :root{--bg:#0a0d12;--panel:#12151c;--card:#161a24;--line:#1e2330;--txt:#e2e4e9;
+        --dim:#6b7394;--accent:#3b82f6;--bin:#00b4ff;--byb:#ff8c1a;
+        --pos:#22c55e;--neg:#ef4444;--warn:#eab308;}
   *{box-sizing:border-box;margin:0;padding:0;}
-  body{background:var(--bg);color:var(--txt);font:14px/1.45 system-ui,sans-serif;
-       padding:18px;max-width:1200px;margin:0 auto;}
-  h1{font-size:18px;margin-bottom:14px;} h1 span{color:var(--dim);font-weight:400;}
-  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:14px;}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;}
-  .card .ex{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);}
-  .card .val{font-size:26px;font-weight:700;margin:4px 0 2px;}
-  .card .sub{font-size:12px;color:var(--dim);}
+  body{background:var(--bg);color:var(--txt);font:13px/1.5 'SF Mono','Cascadia Code','Consolas',monospace;
+       padding:16px 20px;max-width:1400px;margin:0 auto;}
+  h1{font-size:15px;margin-bottom:14px;font-weight:600;letter-spacing:.03em;}
+  h1 span{color:var(--dim);font-weight:400;font-size:12px;}
+  .row{display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px;
+        flex:1;min-width:160px;}
+  .card .label{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);margin-bottom:2px;}
+  .card .value{font-size:22px;font-weight:700;line-height:1.2;}
+  .card .sub{font-size:11px;color:var(--dim);margin-top:2px;}
   .card .sub b{color:var(--txt);font-weight:600;}
-  .up{color:var(--pos);} .down{color:var(--neg);}
-  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;
-         padding:12px 14px;margin-bottom:14px;}
-  .panel h2{font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em;
-            margin-bottom:8px;}
-  canvas{width:100%;height:260px;display:block;}
-  table{width:100%;border-collapse:collapse;font-size:13px;}
-  th{color:var(--dim);font-weight:600;text-align:left;padding:4px 8px;border-bottom:1px solid var(--line);}
-  td{padding:4px 8px;border-bottom:1px solid #1d212b;}
-  .lbl{display:inline-block;padding:1px 7px;border-radius:8px;font-size:11px;font-weight:700;}
-  .lbl.bin{background:#00b4ff22;color:var(--bin);} .lbl.byb{background:#ff8c1a22;color:var(--byb);}
-  .lbl.long{background:#26a69a22;color:var(--pos);} .lbl.short{background:#ef535022;color:var(--neg);}
-  .muted{color:var(--dim);} .right{text-align:right;}
-  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
-  .foot{margin-top:10px;color:var(--dim);font-size:12px;}
-  @media(max-width:820px){.cards{grid-template-columns:1fr;}.grid{grid-template-columns:1fr;}}
+  .up{color:var(--pos);} .down{color:var(--neg);} .flat{color:var(--dim);}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+         padding:12px 14px;margin-bottom:10px;}
+  .panel h2{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.1em;
+            margin-bottom:8px;font-weight:600;}
+  canvas{width:100%;height:240px;display:block;}
+  table{width:100%;border-collapse:collapse;font-size:12px;}
+  th{color:var(--dim);font-weight:600;text-align:left;padding:3px 6px;border-bottom:1px solid var(--line);
+     font-size:10px;text-transform:uppercase;letter-spacing:.06em;}
+  td{padding:3px 6px;border-bottom:1px solid #151923;}
+  .tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;
+       letter-spacing:.03em;}
+  .tag.bin{background:#00b4ff18;color:var(--bin);} .tag.byb{background:#ff8c1a18;color:var(--byb);}
+  .tag.long{background:#22c55e18;color:var(--pos);} .tag.short{background:#ef444418;color:var(--neg);}
+  .tag.ok{background:#22c55e18;color:var(--pos);} .tag.warn{background:#ef444418;color:var(--neg);}
+  .r{text-align:right;} .muted{color:var(--dim);}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+  .metrics{display:grid;grid-template-columns:repeat(auto-fit, minmax(120px, 1fr));gap:8px;margin-bottom:10px;}
+  .metric{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:8px 10px;text-align:center;}
+  .metric .label{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);}
+  .metric .val{font-size:18px;font-weight:700;margin:2px 0;}
+  .metric .val.sm{font-size:14px;}
+  .foot{margin-top:8px;color:var(--dim);font-size:11px;}
+  @media(max-width:820px){.grid2{grid-template-columns:1fr;}.row{flex-direction:column;}}
 </style>
 </head>
 <body>
-<h1>liq <span>· per-exchange equity &amp; performance</span></h1>
+<h1>liq <span>· exchange performance dashboard</span></h1>
 
-<div id="stale" style="display:none;background:#ef535015;border:1px solid #ef5350;color:#ef5350;
-     border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px;">
-  STALE — snapshot.json is older than <span id="stale-sec"></span>s. Bot offline or
-  exchange unreachable. Open positions &amp; unrealized PnL show the last known state.
+<div id="stale" style="display:none;background:#ef444412;border:1px solid #ef4444;color:#ef4444;
+     border-radius:6px;padding:8px 12px;margin-bottom:10px;font-size:12px;">
+  STALE — snapshot older than <span id="stale-sec"></span>s. Bot offline or exchange unreachable.
 </div>
 
-<div class="cards">
-  <div class="card"><div class="ex" style="color:var(--bin)">Binance</div>
-    <div class="val" id="eq-bin">—</div>
-    <div class="sub" id="sub-bin">realized — · unrealized —</div></div>
-  <div class="card"><div class="ex" style="color:var(--byb)">Bybit</div>
-    <div class="val" id="eq-byb">—</div>
-    <div class="sub" id="sub-byb">realized — · unrealized —</div></div>
-  <div class="card"><div class="ex">Combined</div>
-    <div class="val" id="eq-tot">—</div>
-    <div class="sub" id="sub-tot">binance + bybit</div></div>
+<!-- Equity cards -->
+<div class="row">
+  <div class="card"><div class="label" style="color:var(--bin)">Binance</div>
+    <div class="value" id="eq-bin">—</div>
+    <div class="sub" id="sub-bin">—</div></div>
+  <div class="card"><div class="label" style="color:var(--byb)">Bybit</div>
+    <div class="value" id="eq-byb">—</div>
+    <div class="sub" id="sub-byb">—</div></div>
+  <div class="card"><div class="label">Combined</div>
+    <div class="value" id="eq-tot">—</div>
+    <div class="sub" id="sub-tot">—</div></div>
 </div>
 
+<!-- Performance metrics -->
+<div class="metrics" id="metrics">
+  <div class="metric"><div class="label">Win Rate</div><div class="val" id="m-wr">—</div></div>
+  <div class="metric"><div class="label">Profit Factor</div><div class="val" id="m-pf">—</div></div>
+  <div class="metric"><div class="label">Avg Win</div><div class="val sm up" id="m-aw">—</div></div>
+  <div class="metric"><div class="label">Avg Loss</div><div class="val sm down" id="m-al">—</div></div>
+  <div class="metric"><div class="label">Expectancy</div><div class="val sm" id="m-exp">—</div></div>
+  <div class="metric"><div class="label">Max Drawdown</div><div class="val sm down" id="m-dd">—</div></div>
+  <div class="metric"><div class="label">Best Trade</div><div class="val sm up" id="m-bt">—</div></div>
+  <div class="metric"><div class="label">Worst Trade</div><div class="val sm down" id="m-wt">—</div></div>
+  <div class="metric"><div class="label">Total Trades</div><div class="val sm" id="m-tt">—</div></div>
+  <div class="metric"><div class="label">Total PnL</div><div class="val sm" id="m-tpnl">—</div></div>
+</div>
+
+<!-- PnL verification -->
 <div class="panel">
-  <h2>PnL verification <span style="font-weight:400;font-size:12px;color:var(--dim)">
-    dash math vs exchange-reported account</span></h2>
-  <div id="verify"><span class="muted">waiting for exchange account snapshot…</span></div>
+  <h2>PnL Verification <span style="font-weight:400;font-size:10px;color:var(--dim)">
+    dash vs exchange account</span></h2>
+  <div id="verify"><span class="muted">waiting for snapshot…</span></div>
 </div>
 
-<div class="panel"><h2>Equity curve</h2><canvas id="chart"></canvas></div>
+<!-- Equity curve -->
+<div class="panel"><h2>Equity Curve</h2><canvas id="chart"></canvas></div>
 
-<div class="grid">
-  <div class="panel"><h2>Open positions</h2><div id="open">—</div></div>
-  <div class="panel"><h2>Recently closed</h2><div id="closed">—</div></div>
+<!-- Positions -->
+<div class="grid2">
+  <div class="panel"><h2>Open Positions</h2><div id="open">—</div></div>
+  <div class="panel"><h2>Recently Closed</h2><div id="closed">—</div></div>
 </div>
 
-<div class="panel"><h2>Activity</h2><div id="activity" style="font-size:12px;max-height:220px;overflow:auto;">—</div></div>
+<div class="panel"><h2>Activity</h2><div id="activity" style="font-size:11px;max-height:200px;overflow:auto;">—</div></div>
 
 <div class="foot" id="foot">—</div>
 
@@ -532,100 +617,187 @@ PAGE = r"""<!doctype html>
 const REFRESH_MS = __REFRESH__;
 const E = (id)=>document.getElementById(id);
 const fmt = (v,d=2)=> v==null||isNaN(v) ? "—" : Number(v).toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
-const cls = (v)=> v>0?"up":(v<0?"down":"");
+const cls = (v)=> v>0?"up":(v<0?"down":"flat");
 const sym = (v)=> v>0?"+":"";
-const exlbl = (ex)=>`<span class="lbl ${ex==="bybit"?"byb":"bin"}">${ex}</span>`;
-const dirlbl = (d)=>`<span class="lbl ${d==="long"?"long":"short"}">${d}</span>`;
+const exlbl = (ex)=>`<span class="tag ${ex==="bybit"?"byb":"bin"}">${ex}</span>`;
+const dirlbl = (d)=>`<span class="tag ${d==="long"?"long":"short"}">${d.toUpperCase()}</span>`;
 const csv_short = (t)=>{ if(!t) return "—"; const d=new Date(t); if(isNaN(d)) return t; return d.toTimeString().slice(0,8); };
 
-function drawChart(series){
+function drawChart(series, startBal){
   const cv=E("chart"), dpr=window.devicePixelRatio||1, r=cv.getBoundingClientRect();
-  cv.width=r.width*dpr; cv.height=260*dpr;
-  const ctx=cv.getContext("2d"); ctx.scale(dpr,dpr); ctx.clearRect(0,0,r.width,260);
-  if(!series||series.length<2){ ctx.fillStyle="#8b93a5"; ctx.font="13px system-ui"; ctx.fillText("no data yet",12,24); return; }
-  const xs=series.map(p=>p[0]), vals0=series.map(p=>p[1]), vals1=series.map(p=>p[2]);
-  const all=[0,...vals0,...vals1];
-  const t0=xs[0], t1=xs[xs.length-1], lo=Math.min(...all), hi=Math.max(...all);
-  const pad=(hi-lo)*0.08||1, y0=lo-pad, y1=hi+pad;
-  const X=t=> (t-t0)/(t1-t0||1)*r.width, Y=v=> 260-(v-y0)/(y1-y0)*260;
-  ctx.strokeStyle="#212530"; ctx.fillStyle="#8b93a5"; ctx.font="11px system-ui";
-  for(let i=1;i<4;i++){
-    const y=260*i/4; ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(r.width,y); ctx.stroke();
-    const v=y0+(y1-y0)*(1-i/4); ctx.fillText(fmt(v,1),4,y-4);
+  const W=r.width, H=240;
+  cv.width=W*dpr; cv.height=H*dpr;
+  const ctx=cv.getContext("2d"); ctx.scale(dpr,dpr); ctx.clearRect(0,0,W,H);
+  if(!series||series.length<2){ ctx.fillStyle="#6b7394"; ctx.font="12px monospace"; ctx.fillText("no data yet",12,20); return; }
+
+  const xs=series.map(p=>p[0]);
+  const vals0=series.map(p=>p[1]), vals1=series.map(p=>p[2]);
+  const combined=series.map((p,i)=>vals0[i]+vals1[i]);
+  const total_start = (startBal.binance||0) + (startBal.bybit||0);
+  const absCombined = combined.map(v=>v+total_start);
+
+  // Fixed start: y-axis always includes 0 (starting balance)
+  const allVals = [total_start, ...absCombined];
+  const lo = Math.min(...allVals);
+  const hi = Math.max(...allVals);
+  const pad = (hi-lo)*0.1 || 1;
+  const yLo = lo - pad;
+  const yHi = hi + pad;
+
+  const t0=xs[0], t1=xs[xs.length-1];
+  const X = (i) => i/(series.length-1||1)*W;
+  const Y = v => H - (v-yLo)/(yHi-yLo)*H;
+
+  // Grid lines
+  ctx.strokeStyle="#1a1e2a"; ctx.lineWidth=1;
+  for(let i=0;i<=5;i++){
+    const y=H*i/5;
+    ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke();
+    const v = yHi - (yHi-yLo)*(i/5);
+    ctx.fillStyle="#4a5068"; ctx.font="10px monospace"; ctx.fillText(fmt(v,0),4,y-3);
   }
-  if(y0<0&&y1>0){ ctx.strokeStyle="#555"; ctx.setLineDash([4,4]); ctx.beginPath(); const y=Y(0); ctx.moveTo(0,y); ctx.lineTo(r.width,y); ctx.stroke(); ctx.setLineDash([]); }
-  const line=(vals,col)=>{ ctx.strokeStyle=col; ctx.lineWidth=1.6; ctx.beginPath();
-    series.forEach((p,i)=>{ const x=X(p[0]),y=Y(vals[i]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); }); ctx.stroke(); };
-  line(vals0,"#00b4ff"); line(vals1,"#ff8c1a");
-  ctx.fillStyle="#00b4ff"; ctx.fillText("binance",r.width-72,14);
-  ctx.fillStyle="#ff8c1a"; ctx.fillText("bybit",r.width-30,14);
+
+  // Zero/start line
+  if(yLo < total_start && yHi > total_start){
+    ctx.strokeStyle="#3b82f640"; ctx.lineWidth=1; ctx.setLineDash([4,4]);
+    const y=Y(total_start);
+    ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Combined equity (filled area)
+  ctx.beginPath();
+  ctx.moveTo(X(0), Y(absCombined[0]));
+  for(let i=1;i<series.length;i++) ctx.lineTo(X(i), Y(absCombined[i]));
+  ctx.lineTo(X(series.length-1), H);
+  ctx.lineTo(X(0), H);
+  ctx.closePath();
+  const grad = ctx.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0, "rgba(59,130,246,0.15)");
+  grad.addColorStop(1, "rgba(59,130,246,0.01)");
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Combined line
+  ctx.strokeStyle="#3b82f6"; ctx.lineWidth=1.8; ctx.beginPath();
+  series.forEach((p,i)=>{ const x=X(i),y=Y(absCombined[i]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+  ctx.stroke();
+
+  // Binance line
+  ctx.strokeStyle="#00b4ff"; ctx.lineWidth=1.2; ctx.beginPath();
+  const binAbs = vals0.map(v=>v+(startBal.binance||0));
+  series.forEach((p,i)=>{ const x=X(i),y=Y(binAbs[i]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+  ctx.stroke();
+
+  // Bybit line
+  ctx.strokeStyle="#ff8c1a"; ctx.lineWidth=1.2; ctx.beginPath();
+  const bybAbs = vals1.map(v=>v+(startBal.bybit||0));
+  series.forEach((p,i)=>{ const x=X(i),y=Y(bybAbs[i]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+  ctx.stroke();
+
+  // Legend
+  const lx = W - 180;
+  ctx.font="10px monospace";
+  ctx.fillStyle="#3b82f6"; ctx.fillRect(lx,6,12,2); ctx.fillText("combined",lx+16,10);
+  ctx.fillStyle="#00b4ff"; ctx.fillRect(lx+80,6,12,2); ctx.fillText("binance",lx+96,10);
+  ctx.fillStyle="#ff8c1a"; ctx.fillRect(lx+140,6,12,2); ctx.fillText("bybit",lx+156,10);
+
+  // Current value dot
+  const lastY = Y(absCombined[absCombined.length-1]);
+  ctx.beginPath(); ctx.arc(W-2, lastY, 3, 0, Math.PI*2);
+  ctx.fillStyle="#3b82f6"; ctx.fill();
 }
 
 function render(d){
   const st=d.start||{}, eq=d.equity||{}, rz=d.realized||{}, un=d.unrealized||{};
-  const stale=d.stale;
-  if(stale){ E("stale").style.display="block";
+  const m=d.metrics||{};
+
+  // Stale banner
+  if(d.stale){ E("stale").style.display="block";
     E("stale-sec").textContent=Math.round((Date.now()-new Date(d.snapshot_generated||Date.now()))/1000)||"?";
   } else { E("stale").style.display="none"; }
-  const tot=eq.binance+eq.bybit;
+
+  // Equity cards
   for(const k of ["binance","bybit"]){
     const v=eq[k]??0, s= k==="bybit"?"byb":"bin";
-    E("eq-"+s).textContent=fmt(v,2);
-    E("eq-"+s).className="val "+cls(v-st[k]||0);
-    E("sub-"+s).innerHTML=`realized <b>${sym(rz[k]||0)}${fmt(rz[k],2)}</b> · unrealized <b>${sym(un[k]||0)}${fmt(un[k],2)}</b>`;
+    const pnl = v - (st[k]||0);
+    E("eq-"+s).textContent="$"+fmt(v,2);
+    E("eq-"+s).className="value "+cls(pnl);
+    E("sub-"+s).innerHTML=`realized <b>${sym(rz[k]||0)}$${fmt(rz[k],2)}</b> · unreal <b>${sym(un[k]||0)}$${fmt(un[k],2)}</b>`;
   }
-  E("eq-tot").textContent=fmt(tot,2); E("eq-tot").className="val "+cls(tot-(st.binance||0)-(st.bybit||0));
-  E("sub-tot").innerHTML=`start <b>${fmt((st.binance||0)+(st.bybit||0),0)}</b> · realized <b>${sym((rz.binance||0)+(rz.bybit||0))}${fmt((rz.binance||0)+(rz.bybit||0),2)}</b>`;
+  const tot=eq.binance+eq.bybit;
+  const totStart=(st.binance||0)+(st.bybit||0);
+  const totPnl=tot-totStart;
+  E("eq-tot").textContent="$"+fmt(tot,2);
+  E("eq-tot").className="value "+cls(totPnl);
+  E("sub-tot").innerHTML=`start <b>$${fmt(totStart,0)}</b> · pnl <b class="${cls(totPnl)}">${sym(totPnl)}$${fmt(totPnl,2)}</b>`;
 
-    const vf=d.verify||{};
+  // Performance metrics
+  if(m.total_trades > 0){
+    E("m-wr").textContent=m.win_rate+"%";
+    E("m-wr").className="val"+(m.win_rate>=50?" up":" down");
+    E("m-pf").textContent=m.profit_factor+"x";
+    E("m-pf").className="val"+(m.profit_factor>=1?" up":" down");
+    E("m-aw").textContent="$"+fmt(m.avg_win);
+    E("m-al").textContent="$"+fmt(m.avg_loss);
+    E("m-exp").textContent="$"+fmt(m.expectancy);
+    E("m-exp").className="val sm "+cls(m.expectancy);
+    E("m-dd").textContent="$"+fmt(m.max_drawdown)+" ("+m.max_dd_pct+"%)";
+    E("m-bt").textContent="$"+fmt(m.best_trade);
+    E("m-wt").textContent="$"+fmt(m.worst_trade);
+    E("m-tt").textContent=m.total_trades+" ("+m.wins+"W / "+m.losses+"L)";
+    E("m-tpnl").textContent="$"+fmt(m.total_pnl);
+    E("m-tpnl").className="val sm "+cls(m.total_pnl);
+  }
+
+  // Verify
+  const vf=d.verify||{};
   const vkeys=Object.keys(vf);
   E("verify").innerHTML = vkeys.length?`<table>
-    <tr><th></th><th>Dash</th><th>Exchange</th><th>Δ (ex − dash)</th></tr>
+    <tr><th></th><th>Dash</th><th>Exchange</th><th class="r">Delta</th></tr>
     ${vkeys.map(k=>{
       const v=vf[k], ok=v.ok;
-      const badge=`<span class="lbl ${ok?"long":"short"}">${ok?"OK":"WARN"}</span>`;
+      const badge=`<span class="tag ${ok?"ok":"warn"}">${ok?"OK":"WARN"}</span>`;
       const exPnlCell = v.start_unset
         ? `<span class="muted">n/a — set DASH_START_BALANCE_*</span>`
-        : `${sym(v.exchange_pnl)}${fmt(v.exchange_pnl,2)}`;
+        : `${sym(v.exchange_pnl)}$${fmt(v.exchange_pnl,2)}`;
       const deltaCell = v.start_unset
         ? `<span class="muted">n/a</span>`
-        : `${sym(v.delta)}${fmt(v.delta,2)}<div class="muted" style="font-size:11px">tolerance ±${fmt(d.verify_tolerance,0)}</div>`;
+        : `<span class="${cls(v.delta)}">${sym(v.delta)}$${fmt(v.delta,2)}</span>
+           <div class="muted" style="font-size:9px">tol ±$${fmt(d.verify_tolerance,0)}</div>`;
       return `<tr><td>${exlbl(k)} ${badge}</td>
-        <td class="right">${sym(v.dash_pnl)}${fmt(v.dash_pnl,2)}<div class="muted" style="font-size:11px">real ${sym(v.dash_realized)}${fmt(v.dash_realized,2)} · unreal ${sym(v.dash_unrealized)}${fmt(v.dash_unrealized,2)}</div></td>
-        <td class="right">${exPnlCell}<div class="muted" style="font-size:11px">equity ${fmt(v.exchange_equity,2)} ${v.exchange_wallet!=null?`· wallet ${fmt(v.exchange_wallet,2)}`:""} · unreal ${v.exchange_unrealized!=null?fmt(v.exchange_unrealized,2):"—"}</div></td>
-        <td class="right ${cls(v.delta)}">${deltaCell}</td></tr>`;
-    }).join("")}</table>
-    <div class="muted" style="font-size:11px;margin-top:6px">exchange PnL = equity (margin balance) − starting balance. Set DASH_START_BALANCE_* to your real starting balances for an exact match. Closed trades carry the exchange's income-derived realized PnL (real exit + fees + funding); residual delta = adopted/untracked positions (booked at last mark) + open-position unrealized timing + assets outside the perp margin.</div>`
+        <td>${sym(v.dash_pnl)}$${fmt(v.dash_pnl,2)} <span class="muted" style="font-size:10px">real ${sym(v.dash_realized)}$${fmt(v.dash_realized,2)}</span></td>
+        <td>${exPnlCell} <span class="muted" style="font-size:10px">eq $${fmt(v.exchange_equity,2)}</span></td>
+        <td class="r">${deltaCell}</td></tr>`;
+    }).join("")}</table>`
     :"<span class='muted'>waiting for exchange account snapshot…</span>";
 
+  // Chart
+  drawChart(d.series, st);
 
-  const fp=d.first_pt;
-  if(fp){ const db=eq.binance-(st.binance||0)-fp[1], dy=eq.bybit-(st.bybit||0)-fp[2];
-    E("sub-bin").innerHTML+=` · Δ <b class="${cls(db)}">${sym(db)}${fmt(db,2)}</b>`;
-    E("sub-byb").innerHTML+=` · Δ <b class="${cls(dy)}">${sym(dy)}${fmt(dy,2)}</b>`; }
-
-  drawChart(d.series);
-
+  // Open positions
   const rows_o=(d.open||[]).map(t=>`<tr><td>${exlbl(t.exchange)}</td><td>${t.symbol}</td><td>${dirlbl(t.direction)}</td>
-    <td class="right">${fmt(t.qty,4)}</td><td class="right">${fmt(t.entry,6)}</td><td class="right">${fmt(t.mark,6)}</td>
-    <td class="right ${cls(t.pnl)}">${sym(t.pnl)}${fmt(t.pnl,2)}</td></tr>`).join("");
-  E("open").innerHTML= d.open&&d.open.length?`<table><tr><th>Ex</th><th>Symbol</th><th>Dir</th><th class="right">Qty</th><th class="right">Entry</th><th class="right">Mark</th><th class="right">PnL</th></tr>${rows_o}</table>`:"<span class='muted'>none</span>";
+    <td class="r">${fmt(t.qty,4)}</td><td class="r">${fmt(t.entry,6)}</td><td class="r">${fmt(t.mark,6)}</td>
+    <td class="r ${cls(t.pnl)}">${sym(t.pnl)}$${fmt(t.pnl,2)}</td></tr>`).join("");
+  E("open").innerHTML= d.open&&d.open.length?`<table><tr><th>Ex</th><th>Symbol</th><th>Dir</th><th class="r">Qty</th><th class="r">Entry</th><th class="r">Mark</th><th class="r">PnL</th></tr>${rows_o}</table>`:"<span class='muted'>none open</span>";
 
-  const rows_c=(d.closed||[]).map(t=>`<tr><td>${exlbl(t.exchange)}</td><td>${t.symbol}</td><td>${dirlbl(t.direction)}</td>
-    <td class="right">${fmt(t.entry,6)}</td><td>${csv_short(t.closed_at)}</td>
-    <td class="right ${cls(t.realized)}">${sym(t.realized)}${fmt(t.realized,2)}</td></tr>`).join("");
-  E("closed").innerHTML= d.closed&&d.closed.length?`<table><tr><th>Ex</th><th>Symbol</th><th>Dir</th><th class="right">Entry</th><th>Closed</th><th class="right">PnL</th></tr>${rows_c}</table>`:"<span class='muted'>none</span>";
+  // Closed trades
+  const rows_c=(d.closed||[]).slice(0,50).map(t=>`<tr><td>${exlbl(t.exchange)}</td><td>${t.symbol}</td><td>${dirlbl(t.direction)}</td>
+    <td class="r">${fmt(t.entry,6)}</td><td>${csv_short(t.closed_at)}</td>
+    <td class="r ${cls(t.realized)}">${sym(t.realized)}$${fmt(t.realized,2)}</td></tr>`).join("");
+  E("closed").innerHTML= d.closed&&d.closed.length?`<table><tr><th>Ex</th><th>Symbol</th><th>Dir</th><th class="r">Entry</th><th>Closed</th><th class="r">PnL</th></tr>${rows_c}</table>`:"<span class='muted'>none closed</span>";
 
-  const rows_a=(d.activity||[]).map(e=>{
+  // Activity
+  const rows_a=(d.activity||[]).slice(-40).reverse().map(e=>{
     const ev=e.event||"", ex=e.exchange||"", t=e.time||e.closed_at||e.opened_at||"";
     let dt=e.symbol||""; if(e.direction) dt+=` ${e.direction}`;
-    let det=""; if(e.sl!=null) det+=` sl=${fmt(e.sl,6)}`; if(e.tp!=null) det+=` tp=${fmt(e.tp,6)}`; if(e.risk_reward!=null) det+=` rr=${fmt(e.risk_reward,2)}`;
+    let det=""; if(e.sl!=null) det+=` sl=${fmt(e.sl,6)}`; if(e.tp!=null) det+=` tp=${fmt(e.tp,6)}`;
     if(e.error) det+=` <span style="color:var(--neg)">${e.error}</span>`;
-    return `<div style="padding:2px 0;border-bottom:1px solid #1d212b;"><span class="muted">${csv_short(t)}</span> ${ev} ${dt} ${ex?exlbl(ex):""} <span class="muted">${det}</span></div>`;
+    return `<div style="padding:2px 0;border-bottom:1px solid #151923;"><span class="muted">${csv_short(t)}</span> ${ev} ${dt} ${ex?exlbl(ex):""} <span class="muted">${det}</span></div>`;
   }).join("");
-  E("activity").innerHTML=rows_a||"<span class='muted'>none</span>";
+  E("activity").innerHTML=rows_a||"<span class='muted'>no activity</span>";
 
-  E("foot").textContent=`snapshot ${d.generated}${d.error?" · refresh error: "+d.error:""} · open ${(d.open||[]).length} · closed ${(d.closed||[]).length} · series ${(d.series||[]).length}pts${d.stale?" · STALE":""}`;
+  E("foot").textContent=`snapshot ${d.generated}${d.error?" · error: "+d.error:""} · open ${(d.open||[]).length} · closed ${(d.closed||[]).length} · series ${(d.series||[]).length}pts${d.stale?" · STALE":""}`;
 }
 
 async function poll(){

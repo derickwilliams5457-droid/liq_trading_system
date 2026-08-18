@@ -5,14 +5,15 @@ Given a direction + rect_info from strategy.py, computes the SL using the
 LOCALIZED Dynamic ATR — the only stop-loss logic in the system:
 
   SL:
-    - ATR  = mean True Range over the 5 previous candles (interest excluded)
+    - ATR  = mean True Range over the 6 previous candles (interest excluded)
     - dynamic = ATR   (MAD no longer added)
     - long  -> SL = entry - dynamic
     - short -> SL = entry + dynamic
 
-TP is NOT computed here anymore — it comes from hratmap.py's uncleared
-liquidation zones (largest dollar notional inside the rect, on the trade
-side), chosen by run_bot.py. This module only derives SL.
+  TP:
+    - long  -> TP = entry + ATR
+    - short -> TP = entry - ATR
+    - R:R is always ~1:1 by construction.
 
 NOTE: this module is not imported by the live pipeline (run_bot.py calls
 strategy.decide_direction() directly); it is kept as the documented Stage 4
@@ -74,16 +75,17 @@ def compute_levels(symbol: str, direction: str, price: float, candles: pd.DataFr
         return {
             "symbol": symbol, "direction": direction, "entry": price,
             "atr": None, "mad": None, "sl": None, "tp": None,
-            "sl_method": "no_rect_info", "tp_method": "hratmap_uncleared_zone",
-            "risk_reward": None,
+            "sl_method": "no_rect_info", "tp_method": "atr",
         }
 
     atr_value, mad, dynamic = dynamic_atr(candles, config.SL_ATR_WINDOW)
 
     if direction == "short":
         sl_price = price + dynamic
+        tp_price = price - atr_value
     else:
         sl_price = price - dynamic
+        tp_price = price + atr_value
 
     return {
         "symbol": symbol,
@@ -92,8 +94,7 @@ def compute_levels(symbol: str, direction: str, price: float, candles: pd.DataFr
         "atr": round(atr_value, 6),
         "mad": round(mad, 6),
         "sl": round(sl_price, 6),
-        "tp": None,
+        "tp": round(tp_price, 6),
         "sl_method": "localized_atr",
-        "tp_method": "hratmap_uncleared_zone",
-        "risk_reward": None,
+        "tp_method": "atr",
     }

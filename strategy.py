@@ -14,20 +14,13 @@ matching the voted direction:
 If entry sits in the middle 20-80% zone the trade is skipped regardless of
 what the votes say.
 
-The interest candle is EXCLUDED from both the rectangle and the ATR
-calculation. This enables pre-calculation 15 seconds before the candle
-closes — at close time, only the entry price needs to be plugged in.
+SL and TP are both derived from the Dynamic ATR over a 6-candle window:
 
-SL is computed from the LOCALIZED Dynamic ATR over the 5 previous
-candles — the ONLY stop-loss logic in the system:
+    ATR  = mean True Range over the 6-candle window
+    long -> SL = entry - ATR,  TP = entry + ATR
+    short -> SL = entry + ATR,  TP = entry - ATR
 
-    ATR  = mean True Range over the 5-candle window
-    dyn  = ATR                 (MAD no longer added)
-    long -> SL = entry - dyn   |   short -> SL = entry + dyn
-
-TP is NOT computed here anymore — it comes from hratmap.py's uncleared
-liquidation zones (the zone with the largest dollar notional inside the rect,
-on the trade side), and the R:R gate runs in run_bot.py once that TP is known.
+R:R is always ~1:1 by construction.
 
 The pre_close flag allows pre-calculating all of this 15 seconds before the
 interest candle closes. The entry price is unknown at that point — run_bot.py
@@ -35,31 +28,40 @@ plugs it in at close time via _compute_entry_sl().
 
 Returns (direction, candles, levels):
     direction: 'long', 'short', or None (rejected at vote/rect stage)
-    levels:    dict with entry, sl, sl_method, atr, mad, dynamic, rect bounds
-               (rect_high, rect_low, zone_20, zone_80), and tp/risk_reward
-               still None (filled in by run_bot.py from hratmap) or None if
-               rejected.
+    levels:    dict with entry, sl, tp, sl_method, tp_method, atr, dynamic,
+               rect bounds (rect_high, rect_low, zone_20, zone_80), or None
+               if rejected.
 """
 
 import math
 
+import ccxt
 import numpy as np
 import pandas as pd
 
 import config
-import hratmap
 import ratelimit
+
+# Module-level singleton for public market data (no API keys needed).
+# Avoids creating a fresh ccxt.binanceusdm() + load_markets() on every
+# candle fetch — public OHLCV endpoints share one lightweight instance.
+_public_exchange = None
+
+
+def _get_public_exchange():
+    global _public_exchange
+    if _public_exchange is None:
+        _public_exchange = ccxt.binanceusdm({"enableRateLimit": True})
+    return _public_exchange
 
 
 def get_recent_candles(symbol: str, end_time=None, hours: float = None) -> pd.DataFrame:
     """Fetch config.LOOKBACK_HOURS of config.STRATEGY_TIMEFRAME candles.
 
-    Candles come from the SHARED data cache (hratmap.get_cached_candles): the
-    same 3m stream hratmap needs for its zone rays, so strategy and hratmap
-    never each poll Binance for the same data — one cached fetch (tag
-    "klines:3m") serves both. All Binance I/O is serialized + fail-fast on a
+    Uses a cached ccxt Binance USD-M instance (public market data only,
+    no API keys needed). All Binance I/O is serialized + fail-fast on a
     ban via ratelimit, so an IP ban aborts this fetch instead of retry-looping
-    into it and making the ban worse.
+    into it.
     """
     hours = hours if hours is not None else config.LOOKBACK_HOURS
     n = int(hours * 60 / config.BUCKET_MINUTES) + 10
@@ -76,17 +78,31 @@ def get_recent_candles(symbol: str, end_time=None, hours: float = None) -> pd.Da
     else:
         print(f"[strategy] fetching ~{n} candles for {symbol} @ {config.STRATEGY_TIMEFRAME}")
 
-    candles, tag, hit = hratmap.get_cached_candles(
-        symbol, end_time_ms=end_ms, interval=config.STRATEGY_TIMEFRAME,
-        limit=n, fetch_limit=n,
-    )
-    if hit:
-        print(f"[strategy] got {len(candles)} candle(s) for {symbol} from cache "
-              f"[tag={tag}, reuse]  latest close="
-              f"{candles[-1]['close'] if candles else 'n/a'}")
-    else:
-        print(f"[strategy] got {len(candles)} candle(s) for {symbol} [tag={tag}], "
-              f"latest close={candles[-1]['close'] if candles else 'n/a'}")
+    exchange = _get_public_exchange()
+    params = {}
+    if end_ms is not None:
+        params["endTime"] = end_ms
+
+    with ratelimit.serialized():
+        ratelimit.fail_fast_if_banned()
+        raw = exchange.fetch_ohlcv(symbol, config.STRATEGY_TIMEFRAME, limit=n, params=params)
+
+    candles = [
+        {
+            "open_time": int(c[0]),
+            "close_time": int(c[0]) + int(pd.Timedelta(config.STRATEGY_TIMEFRAME).total_seconds() * 1000) - 1,
+            "open": float(c[1]),
+            "high": float(c[2]),
+            "low": float(c[3]),
+            "close": float(c[4]),
+            "volume": float(c[5]),
+            "quote_volume": 0.0,
+        }
+        for c in raw
+    ]
+
+    print(f"[strategy] got {len(candles)} candle(s) for {symbol}, "
+          f"latest close={candles[-1]['close'] if candles else 'n/a'}")
 
     df = pd.DataFrame(candles, columns=[
         "open_time", "close_time", "open", "high", "low", "close", "volume", "quote_volume",
@@ -259,27 +275,22 @@ def _compute_entry_sl(entry: float, direction: str, dynamic: float) -> float:
 
 def _compute_sl(symbol: str, direction: str, rect_info: dict, candles: pd.DataFrame) -> dict:
     """
-    Compute the stop loss from the LOCALIZED Dynamic ATR over the 5-candle
-    window (interest candle excluded). This is the ONLY stop-loss logic in
-    the system:
+    Compute SL and TP from the Dynamic ATR over the SL_ATR_WINDOW candles
+    (interest candle excluded in pre_close, included at close):
 
-      dynamic = ATR(window)               # MAD no longer added
-      long    -> SL = entry - dynamic
-      short   -> SL = entry + dynamic
-
-    TP is NOT computed here anymore — it comes from the uncleared liquidation
-    zones reported by hratmap.py (largest dollar notional inside the rect on
-    the trade side). This function exposes the rect bounds so run_bot.py can
-    filter hratmap zones against them.
+      atr  = mean TR over the window
+      long -> SL = entry - atr,  TP = entry + atr
+      short -> SL = entry + atr,  TP = entry - atr
     """
     atr_value, mad, dynamic = _dynamic_atr(candles, config.SL_ATR_WINDOW)
     entry = rect_info["entry"]
 
-    # ── Stop loss ────────────────────────────────────────────────────
     if direction == "short":
         sl_price = entry + dynamic
+        tp_price = entry - dynamic
     else:
         sl_price = entry - dynamic
+        tp_price = entry + dynamic
 
     return {
         "entry": entry,
@@ -287,10 +298,9 @@ def _compute_sl(symbol: str, direction: str, rect_info: dict, candles: pd.DataFr
         "mad": round(mad, 6),
         "dynamic": round(dynamic, 6),
         "sl": round(sl_price, 6),
+        "tp": round(tp_price, 6),
         "sl_method": "localized_atr",
-        "tp": None,
-        "tp_method": "hratmap_uncleared_zone",
-        "risk_reward": None,
+        "tp_method": "atr",
         "rect_high": rect_info["rect_high"],
         "rect_low": rect_info["rect_low"],
         "zone_20": rect_info["zone_20"],
@@ -302,20 +312,19 @@ def decide_direction(symbol: str, candles: pd.DataFrame = None, end_time=None,
                      pre_close: bool = False) -> tuple:
     """
     Runs the 3-vote system to determine direction, then applies the rectangle
-    zone filter. If it passes, computes the SL from the localized Dynamic
-    ATR (TP is deferred to hratmap.py's uncleared zones, handled
-    by run_bot.py).
+    zone filter. If it passes, computes SL and TP from the localized Dynamic
+    ATR (R:R always ~1:1).
 
     When pre_close=True, the forming interest candle is excluded from the candle
     data (end_time is shifted to bucket_start - 1ms). This allows pre-calculating
-    SL/TP/R:R 15 seconds before the candle closes. The entry price is not yet
+    SL/TP 15 seconds before the candle closes. The entry price is not yet
     known — run_bot.py plugs it in at close time.
 
     Returns (direction, candles, levels):
         direction: 'long', 'short', or None (rejected at vote/rect stage)
-        levels:    dict with entry, sl, sl_method, atr, mad, dynamic, rect bounds
-                  (rect_high/rect_low/zone_20/zone_80), tp=None, risk_reward=None
-                  or None if direction is None.
+        levels:    dict with entry, sl, tp, sl_method, tp_method, atr, dynamic,
+                   rect bounds (rect_high/rect_low/zone_20/zone_80), or None
+                   if direction is None.
     """
     # In pre_close mode, the caller passes end_time = bucket_start - 1ms to
     # exclude the forming interest candle. If no end_time given and pre_close,
@@ -374,17 +383,16 @@ def decide_direction(symbol: str, candles: pd.DataFrame = None, end_time=None,
     print(f"[strategy] {symbol}: majority={majority} -> direction={direction} "
           f"(contrarian={config.CONTRARIAN_MODE}) — entry {entry:.6f} passes rectangle filter")
 
-    # ── SL from the localized Dynamic ATR (TP comes later from hratmap) ──
+    # ── SL + TP from the localized Dynamic ATR ──
     levels = _compute_sl(symbol, direction, rect_info, candles)
 
     levels["symbol"] = symbol
     levels["direction"] = direction
     levels["pre_close"] = pre_close
     print(f"[strategy] {symbol}: {direction.upper()}  entry={entry}  "
-          f"sl={levels['sl']} ({levels['sl_method']} atr={levels['atr']} "
-          f"mad={levels['mad']} dynamic={levels['dynamic']})  "
-          f"rect=[{levels['rect_low']:.6f}, {levels['rect_high']:.6f}]  "
-          f"tp=PENDING (hratmap uncleared zone)")
+          f"sl={levels['sl']}  tp={levels['tp']}  "
+          f"(atr={levels['atr']} dynamic={levels['dynamic']})  "
+          f"rect=[{levels['rect_low']:.6f}, {levels['rect_high']:.6f}]")
     return direction, candles, levels
 
 

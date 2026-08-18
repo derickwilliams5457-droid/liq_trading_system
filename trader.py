@@ -6,11 +6,11 @@ Binance Futures via ccxt. Before opening anything it checks for any existing
 open position across the whole account and refuses to open a second one.
 A background loop polls open-position PnL and appends a row to
 config.PERFORMANCE_CSV on every poll, plus a final row when a position closes.
-A second background loop — the "entry follower" — watches every resting LIMIT
-entry order until it fills or dies. Binance USD-M does not carry TP/SL on a
-limit order, so the follower attaches the STOP_MARKET / TAKE_PROFIT_MARKET
-(closePosition) pair the moment the fill is seen and tracks the position, so
-no fill is ever left unmanaged.
+
+Entry orders use the Binance user data stream (WebSocket) for instant fill
+notifications instead of REST polling. A cancel timer thread handles unfilled
+order timeouts. On fill, the STOP_MARKET / TAKE_PROFIT_MARKET (closePosition)
+pair is attached and the position is tracked, so no fill is ever left unmanaged.
 
 ⚠️  This places real orders against a real exchange account. config.TESTNET
 defaults to True — you must explicitly set LIQ_TESTNET=false to trade live.
@@ -22,6 +22,7 @@ monitor loop):
     python trader.py
 """
 
+import json
 import re
 import threading
 import time
@@ -73,8 +74,11 @@ class Trader:
         # (then attaches TP/SL + tracks the position) or is cancelled.
         self._pending_entries: dict = {}
         self._pending_lock = threading.Lock()
-        self._follower_thread = threading.Thread(target=self._entry_follower_loop, daemon=True)
-        self._follower_thread.start()
+        self._listen_key: str | None = None
+        self._ws_thread = threading.Thread(target=self._user_data_stream_loop, daemon=True)
+        self._ws_thread.start()
+        self._cancel_thread = threading.Thread(target=self._cancel_timer_loop, daemon=True)
+        self._cancel_thread.start()
 
         perfio.ensure_perf_header()
 
@@ -260,7 +264,7 @@ class Trader:
 
     # ── Execution ────────────────────────────────────────────────────────
     def execute_trade(self, levels: dict, deadline_ts: float | None = None,
-                      wait_for_fill: bool = True):
+                      wait_for_fill: bool = True, candle_open_ts: float | None = None):
         """levels is allocation.compute_levels()'s return dict.
 
         deadline_ts: Optional Unix timestamp cutoff. Trade aborts if current time exceeds this.
@@ -269,6 +273,9 @@ class Trader:
             and TP/SL attach in the background. Used by the pre-calc path so a
             coin at close never stalls the pipeline waiting for a fill; the next
             pending coin / signal is processed right away.
+        candle_open_ts: Unix timestamp of the candle open (same as candle_close_time
+            of the previous candle). Used to set the LIMIT fill deadline at exactly
+            candle_open + LIMIT_FILL_WINDOW_SECONDS, independent of placement time.
         """
         # 1. Deadline Check: Prevent executing stale signals
         if deadline_ts is not None and time.time() > deadline_ts:
@@ -282,13 +289,6 @@ class Trader:
             print(f"  [trader] Skipping {levels['symbol']} — "
                   f"{self.open_position_count()} open + {self.pending_entry_count()} pending "
                   f"= {self.open_capacity_used()} slot(s) used, max {config.MAX_CONCURRENT_POSITIONS}.")
-            return None
-
-        if levels.get("risk_reward") is None or levels["risk_reward"] < config.MIN_RISK_REWARD:
-            print(
-                f"  [trader] Skipping {levels['symbol']} — R:R {levels.get('risk_reward')} "
-                f"below MIN_RISK_REWARD ({config.MIN_RISK_REWARD})."
-            )
             return None
 
         symbol = levels["symbol"]
@@ -371,7 +371,9 @@ class Trader:
             "levels": levels,
             "deadline_ts": deadline_ts,
             "placed_at": time.time(),
-            "cancel_at": time.time() + config.LIMIT_FILL_WINDOW_SECONDS,
+            "cancel_at": (candle_open_ts + config.LIMIT_FILL_WINDOW_SECONDS
+                          if candle_open_ts is not None
+                          else time.time() + config.LIMIT_FILL_WINDOW_SECONDS),
             "cancel_attempted": False,
             "attached": False,
             "attached_sl": False,
@@ -403,104 +405,178 @@ class Trader:
 
     # ── Multi-exchange dispatch ──────────────────────────────────────────
     def dispatch_trade(self, levels: dict, deadline_ts: float | None = None,
-                       wait_for_fill: bool = True):
+                       wait_for_fill: bool = True, candle_open_ts: float | None = None):
         """Execute `levels` on Binance, then mirror it to the attached Bybit
         mirror (if any). The mirror runs under its own try/except and its own
         capacity/listing checks, so a Bybit failure NEVER cancels or alters the
         Binance trade — the worst case is the Binance trade proceeds alone."""
-        result = self.execute_trade(levels, deadline_ts=deadline_ts, wait_for_fill=wait_for_fill)
+        result = self.execute_trade(levels, deadline_ts=deadline_ts,
+                                    wait_for_fill=wait_for_fill,
+                                    candle_open_ts=candle_open_ts)
 
         mirror = getattr(self, "mirror", None)
         if mirror is not None:
             try:
-                mirror.execute_trade(levels, deadline_ts=deadline_ts, wait_for_fill=wait_for_fill)
+                mirror.execute_trade(levels, deadline_ts=deadline_ts,
+                                     wait_for_fill=wait_for_fill,
+                                     candle_open_ts=candle_open_ts)
             except Exception as e:
                 print(f"  [trader] Bybit mirror failed for {levels.get('symbol')}: {e}")
         return result
 
-    # ── Entry follower ──────────────────────────────────────────────────
-    def _entry_follower_loop(self):
-        """Daemon: watch every resting LIMIT entry until it fills or dies.
-        Binance USD-M doesn't accept TP/SL on a limit order, so the STOP_MARKET
-        / TAKE_PROFIT_MARKET pair is attached here the moment the fill shows up,
-        and the position is tracked so it is never left unmanaged."""
+    # ── Entry follower (WebSocket-based) ────────────────────────────────
+    def _user_data_stream_loop(self):
+        """Daemon: maintain a Binance user data stream (WebSocket) for instant
+        order fill notifications. Reconnects automatically on disconnects.
+        The listenKey is kept alive via REST PUT every 30 minutes."""
+        import websocket
+
         while True:
             try:
-                with self._pending_lock:
-                    recs = list(self._pending_entries.values())
-                for rec in recs:
-                    self._poll_pending_entry(rec)
-            except Exception as e:
-                print(f"  [trader] Entry follower error: {e}")
-            time.sleep(config.ORDER_POLL_SECONDS)
+                # Create a fresh listenKey
+                self._listen_key = self._create_listen_key()
+                if not self._listen_key:
+                    print(f"  [trader] Could not create listenKey, retrying in 30s...")
+                    time.sleep(30)
+                    continue
 
-    def _poll_pending_entry(self, rec):
-        if rec.get("resolved"):
-            return
-        # Fill window expired (LIMIT_FILL_WINDOW_SECONDS after placement): cancel
-        # the resting order once. A fill racing the cancel is caught by the status
-        # poll right below — never abandoned blind.
-        if time.time() > rec["cancel_at"] and not rec["cancel_attempted"]:
-            rec["cancel_attempted"] = True
-            try:
-                self._guarded(self.exchange.cancel_order, rec["order_id"], rec["symbol"])
-            except ratelimit.BinanceBanned:
-                return  # never poke an active ban — retry next poll cycle
-            except Exception as e:
-                print(f"  [trader] Could not cancel unfilled LIMIT entry for {rec['symbol']}: {e}")
+                if config.TESTNET:
+                    ws_url = f"wss://stream.binancefuture.com/ws/{self._listen_key}"
+                else:
+                    ws_url = f"wss://fstream.binance.com/ws/{self._listen_key}"
+                print(f"  [trader] Connecting user data stream...")
 
+                def on_message(ws, message):
+                    try:
+                        data = json.loads(message)
+                        event_type = data.get("e")
+                        if event_type == "ORDER_TRADE_UPDATE":
+                            self._handle_order_update(data)
+                    except Exception as e:
+                        print(f"  [trader] WS message error: {e}")
+
+                def on_error(ws, error):
+                    print(f"  [trader] WS error: {error}")
+
+                def on_close(ws, close_status_code, close_msg):
+                    print(f"  [trader] WS closed ({close_status_code}: {close_msg})")
+
+                def on_open(ws):
+                    print(f"  [trader] User data stream connected")
+
+                ws = websocket.WebSocketApp(
+                    ws_url,
+                    on_message=on_message,
+                    on_error=on_error,
+                    on_close=on_close,
+                    on_open=on_open,
+                )
+
+                # Run with a 30-minute keepalive ping
+                ws_thread = threading.Thread(target=ws.run_forever, kwargs={
+                    "ping_interval": 1800,
+                    "ping_timeout": 10,
+                }, daemon=True)
+                ws_thread.start()
+
+                # Keep the listenKey alive while the WS is running
+                while ws_thread.is_alive():
+                    time.sleep(60)
+                    try:
+                        self._guarded(
+                            self.exchange.fapiPrivatePutListenKey,
+                        )
+                    except Exception as e:
+                        print(f"  [trader] ListenKey keepalive failed: {e}")
+                        break
+
+                ws.close()
+                self._delete_listen_key()
+                print(f"  [trader] User data stream disconnected, reconnecting...")
+
+            except Exception as e:
+                print(f"  [trader] User data stream error: {e}")
+                time.sleep(5)
+
+    def _create_listen_key(self) -> str | None:
+        """Create a new Binance USD-M listenKey for the user data stream."""
         try:
-            order = self._guarded(self.exchange.fetch_order, rec["order_id"], rec["symbol"])
-        except ratelimit.BinanceBanned:
-            return  # never poke an active ban — retry next poll cycle
+            result = self._guarded(self.exchange.fapiPrivatePostListenKey)
+            return result.get("listenKey")
         except Exception as e:
-            rec["poll_failures"] = rec.get("poll_failures", 0) + 1
-            # If polling keeps failing after the fill window expired, the order
-            # id is effectively unreachable — abandon instead of reprinting the
-            # same error every poll forever.
-            if rec["poll_failures"] >= config.MAX_POLL_FAILURES and time.time() > rec["cancel_at"]:
-                print(f"  [trader] Could not poll fill status for {rec['symbol']} after "
-                      f"{rec['poll_failures']} attempts ({type(e).__name__}); fill window "
-                      f"expired — abandoning.")
-                self._finalize_failed(rec, "unresolvable")
-            else:
-                print(f"  [trader] Could not poll fill status for {rec['symbol']}: {e}")
+            print(f"  [trader] Failed to create listenKey: {e}")
+            return None
+
+    def _delete_listen_key(self):
+        """Delete the current listenKey to cleanly close the user data stream."""
+        if self._listen_key:
+            try:
+                self._guarded(self.exchange.fapiPrivateDeleteListenKey,
+                              {"listenKey": self._listen_key})
+            except Exception:
+                pass  # best-effort cleanup
+            self._listen_key = None
+
+    def _handle_order_update(self, data: dict):
+        """Process an ORDER_TRADE_UPDATE event from the user data stream.
+        On fill, attach TP/SL and track the position. On cancel/expired,
+        finalize as failed."""
+        order = data.get("o", {})
+        order_id = str(order.get("i", ""))
+        status = order.get("X", "")
+        filled_qty = float(order.get("z", 0))
+
+        if not order_id:
             return
 
-        status = order.get("status")
-        filled_qty = float(order.get("filled") or 0)
-        if status == "closed" or filled_qty > 0:
-            # 'closed' = fully filled. 'filled_qty > 0' = the cancel raced a fill
-            # (or the order partially filled before the rest was canceled): the
-            # exchange is ALREADY holding a position, so it MUST be tracked and
-            # managed — never orphaned. Treating every 'canceled' as 'never
-            # filled' is exactly how an untracked, TP/SL-less position (a
-            # "ghost") ends up live on the account.
+        with self._pending_lock:
+            rec = self._pending_entries.get(order_id)
+        if not rec or rec.get("resolved"):
+            return
+
+        if status == "FILLED" or filled_qty > 0:
             if not rec.get("filled"):
                 rec["filled"] = True
-                # Track the trade IMMEDIATELY on fill — before the TP/SL attach —
-                # so the monitor loop can log it even if the attach retries or fails.
                 rec["meta"] = {
                     **rec["levels"],
                     "qty": filled_qty if filled_qty > 0 else rec["qty"],
                     "opened_at": datetime.now(timezone.utc).isoformat(),
                 }
                 self._open_trades[rec["symbol"]] = rec["meta"]
-                rec["event"].set()          # release execute_trade's wait now
+                rec["event"].set()
                 print(f"  [trader] Filled {rec['direction'].upper()} {rec['symbol']} "
                       f"qty={rec['meta']['qty']} entry={rec['entry_price']}"
-                      f" (status={status}, filled={filled_qty})")
+                      f" (WS fill, status={status}, filled={filled_qty})")
             result = self._attach_tp_sl(rec)
             if result is True:
-                self._finalize_filled(rec)  # TP/SL on, trade fully opened
+                self._finalize_filled(rec)
             elif result == "abandon":
-                # Permanent attach failure (no position behind the fill, or the
-                # retry cap ran out) — stop retrying. The trade stays tracked in
-                # _open_trades so the monitor still closes it out when the
-                # exchange-side position disappears; it just never gets TP/SL.
                 self._finalize_failed(rec, "attach_abandoned")
-        elif status in ("canceled", "expired", "rejected"):
-            self._finalize_failed(rec, status)
+        elif status in ("CANCELED", "EXPIRED", "REJECTED"):
+            self._finalize_failed(rec, status.lower())
+
+    def _cancel_timer_loop(self):
+        """Daemon: check every pending LIMIT entry and cancel it when the fill
+        window expires. Runs independently of the WebSocket — the WS handles
+        fill events, this handles timeouts."""
+        while True:
+            try:
+                with self._pending_lock:
+                    recs = list(self._pending_entries.values())
+                for rec in recs:
+                    if rec.get("resolved"):
+                        continue
+                    if time.time() > rec["cancel_at"] and not rec["cancel_attempted"]:
+                        rec["cancel_attempted"] = True
+                        try:
+                            self._guarded(self.exchange.cancel_order, rec["order_id"], rec["symbol"])
+                        except ratelimit.BinanceBanned:
+                            continue
+                        except Exception as e:
+                            print(f"  [trader] Could not cancel unfilled LIMIT entry for {rec['symbol']}: {e}")
+            except Exception as e:
+                print(f"  [trader] Cancel timer error: {e}")
+            time.sleep(1)
 
     def _attach_tp_sl(self, rec):
         """Idempotent TP/SL attach after a LIMIT fill. Each half (STOP_MARKET /

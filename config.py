@@ -164,51 +164,25 @@ ENTRY_TIMEOUT_SECONDS   = 60
 PRE_CALC_EXECUTE_SECONDS = 20
 PRE_CLOSE_SECONDS       = 15    # the pre-spike signal is designed to arrive ~15s before close
 # Resting LIMIT entry lifetime: how long an unfilled limit order stays live after
-# placement before the entry follower cancels it. Independent of the compute
-# deadline above — a limit only fills if price comes back to it, so it gets a
-# full window to be revisited.
-LIMIT_FILL_WINDOW_SECONDS = 120
-ORDER_POLL_SECONDS      = 1     # how often to check fill status within that window
+# placement before the entry follower cancels it. Measured from candle open
+# (not placement), so the actual fill window from placement is shorter by the
+# compute time. Independent of the compute deadline above.
+LIMIT_FILL_WINDOW_SECONDS = 90
 
-# ── Rectangle strategy (strategy.py + allocation.py) ──────────────────────────
+# ── Rectangle strategy (strategy.py) ─────────────────────────────────────────
 RECTANGLE_CANDLES = 5           # 5 previous 3min candles (interest candle excluded)
-MIN_RR = 1.0                    # minimum acceptable risk:reward (overrides MIN_RISK_REWARD for rectangle trades)
 
-# ── Localized Dynamic-ATR stop loss (strategy.py + allocation.py) ─────────────
-# The ONLY stop-loss logic in the system. SL distance = Dynamic ATR over the
-# 5+1 candle window: ATR = mean(TR), dynamic = ATR (MAD is computed/reported
-# for reference only and is no longer added). Applied as entry - dynamic
-# (long) / entry + dynamic (short).
-SL_ATR_WINDOW = RECTANGLE_CANDLES   # 5 previous candles (interest candle excluded)
-
-# ── Allocation / risk (allocation.py) ────────────────────────────────────────
-ANOMALY_CHART_TF        = EXCHANGE_TIMEFRAME   # ccxt notation — anomaly.py normalizes internally for resample
-ATR_TP_FALLBACK_MULT     = 2.5   # TP distance in ATRs when no uncleared zone exists in the TP direction
-MIN_RISK_REWARD          = 1.0   # trades below this R:R are skipped entirely — never executed
-
-# ── Performance / speculative precompute (run_bot.py + hratmap.py) ──────────
-# The 3m aggTrades window is fetched in slices (each slice < 1h is the Binance
-# limit for startTime+endTime together). Slices are fetched with a single
-# worker AND serialized by the global one-at-a-time lock in ratelimit.py, so
-# the bot always polls Binance strictly one request at a time.
-SLICE_MINUTES                = 6     # aggTrades slice size in minutes
-MAX_WORKERS                  = 1     # concurrent slice fetchers (serialized by the global rate limiter)
-# hratmap pulls aggTrades for the TP-zone window only — the prior 9 completed
-# candles (9 x 3m = 27min). Smaller than the full lookback, so the expensive
-# aggTrades pull finishes well inside the pre-close budget.
-HRATMAP_LOOKBACK_CANDLES     = 9
-# A symbol SILENCE_THRESHOLD+ silent buckets deep is one active bucket away
-# from firing "activity_spike" — keep its zone window warm in the background
-# so the trigger finds the slow aggTrades pull already done.
-WARM_SYMBOLS                 = 1     # how many on-deck symbols to precompute for
-WARM_POLL_SECONDS            = 15    # how often the warmer re-checks bucket state
-MAX_CONCURRENT_ZONE_FETCHES  = 1     # cap on simultaneous hratmap aggTrades pulls
+# ── Localized Dynamic-ATR stop loss + take profit (strategy.py) ──────────────
+# SL and TP are both derived from the Dynamic ATR over a 6-candle window:
+#   ATR = mean(TR over 6 candles)
+#   long  -> SL = entry - ATR,  TP = entry + ATR
+#   short -> SL = entry + ATR,  TP = entry - ATR
+# R:R is always ~1:1 by construction.
+SL_ATR_WINDOW = 6               # 6 candles for ATR (includes interest candle at close)
 
 # ── Shared market-data cache (data_cache.py) ────────────────────────────────
-# Strategy's 3m candles and hratmap's zone-window candles are the SAME stream —
-# cached once (tag "klines:3m") and shared, so neither re-polls Binance for
-# data the other already fetched. run_bot.py also evicts the per-symbol
-# entries after each verdict; the TTL below is just a safety net.
+# Strategy's 3m candles are cached with a TTL safety net. run_bot.py evicts
+# per-symbol entries after each verdict so the cache never clogs up.
 CANDLE_CACHE_TTL             = 300    # seconds a cached candle batch stays fresh
 
 # ── Global Binance rate limiting (ratelimit.py) ──────────────────────────────
@@ -226,10 +200,6 @@ LEVERAGE                = int(os.getenv("LIQ_LEVERAGE", "5"))
 POSITION_POLL_SECONDS   = 5     # how often trader.py polls open-position PnL
 POSITION_CLOSED_CONFIRM_POLLS = 2  # consecutive polls with no position before a trade is declared closed
 MAX_CONCURRENT_POSITIONS = 3     # multiple positions open at a time (multi-coin execution)
-# If the entry follower can't poll an order for this many consecutive ticks
-# AND its fill window has already expired, the order is abandoned instead of
-# reprinting the error every second forever.
-MAX_POLL_FAILURES = 3
 # If TP/SL attachment keeps failing for a filled LIMIT entry with transient
 # errors, stop retrying after this many polls instead of reprinting oco_failed
 # every second forever. Permanent errors abandon immediately: -4509 (no open
@@ -262,13 +232,7 @@ BYBIT_LEVERAGE           = int(os.getenv("BYBIT_LEVERAGE", "5"))
 # Binance is full but Bybit has slots, the mirror still takes the trade (and
 # vice versa). A coin not listed on Bybit simply aborts the Bybit side.
 BYBIT_MAX_CONCURRENT_POSITIONS = int(os.getenv("BYBIT_MAX_CONCURRENT_POSITIONS", "3"))
-BYBIT_ORDER_POLL_SECONDS  = 1     # entry-follower fill/cancel poll cadence
-# If the entry follower can't poll an order for this many consecutive ticks
-# AND its fill window has already expired, the order is abandoned instead of
-# reprinting the error every second forever. (Bybit's fetchOrder only reaches
-# the account's last 500 orders; a stale order id can't be polled at all.)
-BYBIT_MAX_POLL_FAILURES = 3
-BYBIT_LIMIT_FILL_WINDOW_SECONDS = 120   # resting LIMIT entry lifetime before auto-cancel
+BYBIT_LIMIT_FILL_WINDOW_SECONDS = 90    # resting LIMIT entry lifetime before auto-cancel
 BYBIT_POSITION_POLL_SECONDS = 5   # mirror monitor PnL poll cadence
 BYBIT_POSITION_CLOSED_CONFIRM_POLLS = 2  # consecutive absent polls before a Bybit trade is declared closed
 
