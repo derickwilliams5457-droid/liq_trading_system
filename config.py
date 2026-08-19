@@ -59,7 +59,7 @@ MIN_ACTIVITY_USD     = 1000  # a bucket only counts as "active" if its LARGEST S
 # edits take effect on the next poll without restarting any process. If the
 # file is missing the filter is DISABLED (loudly logged) so a typo'd path
 # can't silently kill all trading.
-TRADED_SYMBOLS_FILE = Path(os.getenv("LIQ_SYMBOLS_FILE", BASE_DIR / "binance_futures_symbols.txt"))
+TRADED_SYMBOLS_FILE = Path(os.getenv("LIQ_SYMBOLS_FILE", BASE_DIR / "symbols.txt"))
 
 _allowlist_mtime: int | None = None   # st_mtime_ns of the last successful load
 _allowlist: set | None = None
