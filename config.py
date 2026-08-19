@@ -35,6 +35,7 @@ PERFORMANCE_CSV   = DATA_DIR / "performance.csv"            # written by trader.
 # the dashboard's "open positions" reads — never CSV history inference.
 TRADES_LEDGER_FILE = DATA_DIR / "trades.json"               # per-exchange open-trade metadata
 SNAPSHOT_FILE      = DATA_DIR / "snapshot.json"             # live open positions + PnL, rewritten every monitor poll
+SIGNALS_FILE       = DATA_DIR / "signals.json"              # combined signal storage for both exchanges
 
 # ── Liquidation stream (liq_stream.py) ───────────────────────────────────────
 WS_URL       = "wss://fstream.binance.com/market/ws/!forceOrder@arr"

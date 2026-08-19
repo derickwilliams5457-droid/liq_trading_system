@@ -166,3 +166,62 @@ def read_snapshot() -> dict | None:
         return data if isinstance(data, dict) else None
     except Exception:
         return None
+
+
+def _load_signals_locked() -> dict:
+    path = config.SIGNALS_FILE
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def load_signals() -> dict:
+    with _WRITE_LOCK:
+        return _load_signals_locked()
+
+
+def save_signal(exchange: str, symbol: str, meta: dict):
+    """Write a trade signal to the combined signals file. Called on fill so
+    the monitor can distinguish system-initiated positions from external ones
+    across both exchanges."""
+    with _WRITE_LOCK:
+        signals = _load_signals_locked()
+        ex = signals.setdefault(exchange, {})
+        ex[symbol] = {
+            "symbol": meta.get("symbol", symbol),
+            "direction": meta.get("direction", ""),
+            "qty": meta.get("qty", 0),
+            "entry": meta.get("entry", 0),
+            "sl": meta.get("sl", ""),
+            "tp": meta.get("tp", ""),
+            "opened_at": meta.get("opened_at", ""),
+        }
+        _atomic_write(config.SIGNALS_FILE, signals)
+
+
+def remove_signal(exchange: str, symbol: str):
+    """Remove a signal from the combined file when a position closes."""
+    with _WRITE_LOCK:
+        signals = _load_signals_locked()
+        ex = signals.get(exchange)
+        if ex and symbol in ex:
+            del ex[symbol]
+            if not ex:
+                del signals[exchange]
+            _atomic_write(config.SIGNALS_FILE, signals)
+
+
+def find_signal(exchange: str, symbol: str) -> dict | None:
+    """Look up a signal by exchange + symbol. Returns the stored meta dict
+    or None if the system didn't place this trade."""
+    with _WRITE_LOCK:
+        signals = _load_signals_locked()
+        ex = signals.get(exchange)
+        if ex:
+            return ex.get(symbol)
+        return None

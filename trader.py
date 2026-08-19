@@ -679,6 +679,7 @@ class Trader:
             self._pending_entries.pop(rec["order_id"], None)
         self._open_trades[rec["symbol"]] = rec["meta"]
         perfio.update_ledger(self.EXCHANGE_ID, self._open_trades)
+        perfio.save_signal(self.EXCHANGE_ID, rec["symbol"], rec["meta"])
         self._log_trade_event({"event": "opened", **rec["meta"]})
         print(f"  [trader] Opened {rec['direction'].upper()} {rec['symbol']} "
               f"qty={rec['qty']} entry={rec['entry_price']} (LIMIT filled) "
@@ -718,8 +719,26 @@ class Trader:
 
     def _adopt_position(self, symbol, pos, contracts) -> dict:
         """A position exists on the exchange that isn't in the ledger (opened
-        before a restart, or never tracked). Build best-effort meta and adopt
-        it so it gets a real close path instead of a forever-"open" ghost row."""
+        before a restart, or never tracked). Check the signals file first — if
+        the system placed this trade, use the stored entry/tp/sl instead of
+        adopting with blanks. Only truly external positions get adopted."""
+        stored = perfio.find_signal(self.EXCHANGE_ID, symbol)
+        if stored is not None:
+            meta = {
+                "symbol": symbol,
+                "direction": stored.get("direction", "long" if contracts > 0 else "short"),
+                "qty": stored.get("qty", abs(contracts)),
+                "entry": stored.get("entry", float(pos.get("entryPrice") or 0)),
+                "sl": stored.get("sl", ""),
+                "tp": stored.get("tp", ""),
+                "opened_at": stored.get("opened_at", datetime.now(timezone.utc).isoformat()),
+            }
+            self._open_trades[symbol] = meta
+            self._log_trade_event({"event": "opened", **meta})
+            perfio.update_ledger(self.EXCHANGE_ID, self._open_trades)
+            print(f"  [trader] Restored from signals file: {symbol} "
+                  f"{meta['direction']} qty={meta['qty']} sl={meta['sl']} tp={meta['tp']}")
+            return meta
         meta = {
             "symbol": symbol,
             "direction": "long" if contracts > 0 else "short",
@@ -816,6 +835,7 @@ class Trader:
                                   f"(realized {rpnl} via {source})")
                             absent_streaks.pop(symbol, None)
                             changed = True
+                            perfio.remove_signal(self.EXCHANGE_ID, symbol)
                 if changed:
                     perfio.update_ledger(self.EXCHANGE_ID, self._open_trades)
 
