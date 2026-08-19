@@ -697,6 +697,82 @@ class BybitMirror:
               f"{meta['direction']} qty={meta['qty']}")
         return meta
 
+    def _rectify_naked_positions(self):
+        """Startup pass: find every open Bybit position and ensure it has
+        native TP/SL set. If a position is naked (stopLoss/takeProfit missing
+        or zero), fetch stored TP/SL from signals.json and attach them via
+        the trading-stop endpoint. This catches positions where the initial
+        attach failed, the exchange rejected it, or the system restarted
+        mid-attach."""
+        try:
+            positions = self.get_open_positions()
+        except Exception as e:
+            print(f"  [bybit] Cannot rectify — failed to fetch positions: {e}")
+            return
+
+        for pos in positions:
+            raw_symbol = (pos.get("info") or {}).get("symbol")
+            symbol = (raw_symbol or pos.get("symbol") or "").upper()
+            if "/" in symbol:
+                symbol = symbol.replace("/", "").split(":")[0]
+            contracts = float(pos.get("contracts") or 0)
+            if contracts == 0:
+                continue
+
+            info = pos.get("info") or {}
+            cur_sl = float(info.get("stopLoss") or 0)
+            cur_tp = float(info.get("takeProfit") or 0)
+            unified = self._to_unified(symbol)
+
+            meta = self._open_trades.get(symbol)
+            sl = meta.get("sl", "") if meta else ""
+            tp = meta.get("tp", "") if meta else ""
+
+            if not sl and not tp:
+                stored = perfio.find_signal(self.EXCHANGE_ID, symbol)
+                if stored:
+                    sl = stored.get("sl", "")
+                    tp = stored.get("tp", "")
+
+            if not sl and not tp:
+                continue
+
+            needs_sl = cur_sl == 0 and sl
+            needs_tp = cur_tp == 0 and tp
+            if not needs_sl and not needs_tp:
+                continue
+
+            params = {}
+            if needs_sl:
+                sl_price = self.exchange.price_to_precision(unified, sl)
+                params["stopLoss"] = str(sl_price)
+            if needs_tp:
+                tp_price = self.exchange.price_to_precision(unified, tp)
+                params["takeProfit"] = str(tp_price)
+
+            if not params:
+                continue
+
+            try:
+                self._guarded(
+                    self.exchange.privatePostV5PositionTradingStop,
+                    {"category": "linear", "symbol": unified, **params},
+                )
+                parts = []
+                if needs_sl:
+                    parts.append(f"SL={sl_price}")
+                    self._log_trade_event({"event": "rectified_sl", "symbol": symbol,
+                                           "sl": sl_price, "qty": contracts})
+                if needs_tp:
+                    parts.append(f"TP={tp_price}")
+                    self._log_trade_event({"event": "rectified_tp", "symbol": symbol,
+                                           "tp": tp_price, "qty": contracts})
+                print(f"  [bybit] Rectified {symbol}: {', '.join(parts)}")
+            except Exception as e:
+                print(f"  [bybit] Rectify {symbol} failed: {e}")
+                self._log_trade_event({"event": "rectify_failed", "symbol": symbol,
+                                       "error": str(e), **params})
+
     def monitor_loop(self):
         """Run forever: poll Bybit open positions, log PnL, detect closes,
         snapshot. Same exchange-truth design as trader.py — every position is
@@ -704,6 +780,7 @@ class BybitMirror:
         snapshot.json is rewritten every poll for the dashboard."""
         print("  [bybit] Monitor loop started.")
         absent_streaks: dict[str, int] = {}
+        self._rectify_naked_positions()
         while True:
             try:
                 positions = self.get_open_positions()

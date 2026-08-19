@@ -774,10 +774,96 @@ class Trader:
               f"{meta['direction']} qty={meta['qty']}")
         return meta
 
+    def _rectify_naked_positions(self):
+        """Startup pass: find every open position on Binance and ensure it has
+        TP/SL orders attached. If a position is naked (missing one or both),
+        fetch the stored TP/SL from signals.json and place the missing orders.
+        This catches positions where the attach failed silently, the exchange
+        cancelled the orders, or the system restarted mid-attach."""
+        try:
+            positions = self.get_open_positions()
+        except Exception as e:
+            print(f"  [trader] Cannot rectify — failed to fetch positions: {e}")
+            return
+
+        for pos in positions:
+            raw_symbol = (pos.get("info") or {}).get("symbol")
+            symbol = (raw_symbol or pos.get("symbol") or "").upper()
+            contracts = float(
+                pos.get("contracts") or pos.get("info", {}).get("positionAmt", 0) or 0
+            )
+            if contracts == 0:
+                continue
+
+            meta = self._open_trades.get(symbol)
+            sl = meta.get("sl", "") if meta else ""
+            tp = meta.get("tp", "") if meta else ""
+
+            if not sl and not tp:
+                stored = perfio.find_signal(self.EXCHANGE_ID, symbol)
+                if stored:
+                    sl = stored.get("sl", "")
+                    tp = stored.get("tp", "")
+
+            if not sl and not tp:
+                continue
+
+            try:
+                open_orders = self._guarded(self.exchange.fetch_open_orders, symbol)
+            except Exception as e:
+                print(f"  [trader] Rectify {symbol}: could not fetch open orders: {e}")
+                continue
+
+            has_sl = any(o.get("type") == "STOP_MARKET" for o in open_orders)
+            has_tp = any(o.get("type") == "TAKE_PROFIT_MARKET" for o in open_orders)
+
+            if has_sl and has_tp:
+                continue
+
+            close_side = "sell" if (meta.get("direction") if meta else contracts > 0) else "buy"
+            qty = abs(contracts)
+
+            if sl and not has_sl:
+                try:
+                    self._guarded(
+                        self.exchange.create_order, symbol, "STOP_MARKET", close_side, qty,
+                        params={"stopPrice": sl, "closePosition": True},
+                    )
+                    print(f"  [trader] Rectified SL for {symbol} @ {sl}")
+                    self._log_trade_event({"event": "rectified_sl", "symbol": symbol,
+                                           "sl": sl, "qty": qty, "direction": close_side})
+                except Exception as e:
+                    code = self._binance_error_code(e)
+                    if code == -4130:
+                        print(f"  [trader] Rectify {symbol}: SL order already exists (-4130)")
+                    else:
+                        print(f"  [trader] Rectify {symbol}: SL attach failed: {e}")
+                        self._log_trade_event({"event": "rectify_failed", "symbol": symbol,
+                                               "side": "sl", "error": str(e)})
+
+            if tp and not has_tp:
+                try:
+                    self._guarded(
+                        self.exchange.create_order, symbol, "TAKE_PROFIT_MARKET", close_side, qty,
+                        params={"stopPrice": tp, "closePosition": True},
+                    )
+                    print(f"  [trader] Rectified TP for {symbol} @ {tp}")
+                    self._log_trade_event({"event": "rectified_tp", "symbol": symbol,
+                                           "tp": tp, "qty": qty, "direction": close_side})
+                except Exception as e:
+                    code = self._binance_error_code(e)
+                    if code == -4130:
+                        print(f"  [trader] Rectify {symbol}: TP order already exists (-4130)")
+                    else:
+                        print(f"  [trader] Rectify {symbol}: TP attach failed: {e}")
+                        self._log_trade_event({"event": "rectify_failed", "symbol": symbol,
+                                               "side": "tp", "error": str(e)})
+
     def monitor_loop(self):
         """Run forever: poll open positions, log PnL, detect closes, snapshot."""
         print("  [trader] Monitor loop started.")
         absent_streaks: dict[str, int] = {}  # symbol -> consecutive absent polls
+        self._rectify_naked_positions()
         while True:
             try:
                 try:
