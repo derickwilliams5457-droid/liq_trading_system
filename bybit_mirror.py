@@ -648,10 +648,9 @@ class BybitMirror:
             "sl": "",
             "tp": "",
             "opened_at": datetime.now(timezone.utc).isoformat(),
-            "adopted": True,
         }
         self._open_trades[symbol] = meta
-        self._log_trade_event({"event": "adopted_position", **meta})
+        self._log_trade_event({"event": "opened", **meta})
         perfio.update_ledger(self.EXCHANGE_ID, self._open_trades)
         print(f"  [bybit] Adopted untracked position: {symbol} "
               f"{meta['direction']} qty={meta['qty']}")
