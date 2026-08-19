@@ -318,16 +318,19 @@ class BybitMirror:
         if deadline_ts is not None and time.time() > deadline_ts:
             print(f"  [bybit] Aborting mirror of {levels.get('symbol', 'trade')} — "
                   f"signal deadline expired ({time.time() - deadline_ts:.2f}s late).")
+            self._log_trade_event({"event": "deadline_expired", "symbol": levels.get("symbol", ""), **levels})
             return None
 
         symbol = levels["symbol"]
         if not config.is_traded_symbol(symbol):
             print(f"  [bybit] {symbol} not in traded-symbols allowlist — mirror skipped.")
+            self._log_trade_event({"event": "symbol_not_allowed", "symbol": symbol, **levels})
             return None
 
         if self.has_open_position():
             print(f"  [bybit] Skipping {levels['symbol']} — Bybit capacity full "
                   f"({self.open_capacity_used()}/{config.BYBIT_MAX_CONCURRENT_POSITIONS}).")
+            self._log_trade_event({"event": "capacity_full", "symbol": symbol, **levels})
             return None
 
         if not self._is_listed(symbol):
@@ -357,6 +360,7 @@ class BybitMirror:
         # ── Size with Bybit's own allocation ──
         if tlevels["entry"] <= 0:
             print(f"  [bybit] {symbol}: non-positive translated entry, mirror aborted.")
+            self._log_trade_event({"event": "invalid_entry", "symbol": symbol, **tlevels})
             return None
         qty = (config.BYBIT_RISK_PER_TRADE_USD * config.BYBIT_LEVERAGE) / tlevels["entry"]
 
@@ -367,14 +371,21 @@ class BybitMirror:
                 print(f"  [bybit] Margin check {symbol}: allocated "
                       f"{config.BYBIT_RISK_PER_TRADE_USD:.2f} USDT margin > free "
                       f"{free:.2f} USDT — mirror skipped, not enough Bybit margin.")
+                self._log_trade_event({"event": "margin_insufficient", "symbol": symbol,
+                                       "allocated": config.BYBIT_RISK_PER_TRADE_USD,
+                                       "free": free, **tlevels})
                 return None
         except Exception as e:
             print(f"  [bybit] Could not check Bybit margin for {symbol}: {e}")
+            self._log_trade_event({"event": "margin_check_error", "symbol": symbol,
+                                   "error": str(e), **tlevels})
 
         try:
             self._guarded(self.exchange.set_leverage, config.BYBIT_LEVERAGE, unified)
         except Exception as e:
             print(f"  [bybit] Could not set Bybit leverage: {e}")
+            self._log_trade_event({"event": "leverage_set_failed", "symbol": symbol,
+                                   "error": str(e), **tlevels})
 
         try:
             entry_price = self.exchange.price_to_precision(unified, tlevels["entry"])
@@ -452,6 +463,9 @@ class BybitMirror:
         print(f"  [bybit] LIMIT {side.upper()} {symbol} qty={qty_precise} "
               f"@{entry_price} placed (SL {sl_price} / TP {tp_price} attached) "
               f"{'— not waiting for fill' if not wait_for_fill else ''}")
+        self._log_trade_event({"event": "order_placed", "symbol": symbol, "direction": direction,
+                               "qty": qty_precise, "entry": entry_price,
+                               "sl": sl_price, "tp": tp_price, "side": side})
 
         if not wait_for_fill:
             return entry_order
@@ -588,9 +602,16 @@ class BybitMirror:
                         try:
                             self._guarded(self.exchange.cancel_order,
                                           rec["order_id"], rec["unified"])
+                            self._log_trade_event({"event": "order_cancelled",
+                                                   "symbol": rec["symbol"],
+                                                   "order_id": rec["order_id"]})
                         except Exception as e:
                             print(f"  [bybit] Could not cancel unfilled LIMIT entry for "
                                   f"{rec['symbol']}: {e}")
+                            self._log_trade_event({"event": "cancel_failed",
+                                                   "symbol": rec["symbol"],
+                                                   "order_id": rec["order_id"],
+                                                   "error": str(e)})
             except Exception as e:
                 print(f"  [bybit] Cancel timer error: {e}")
             time.sleep(1)

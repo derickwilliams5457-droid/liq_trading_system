@@ -251,11 +251,14 @@ class Trader:
                 print(f"  [trader] Margin check {symbol}: allocated "
                       f"{config.RISK_PER_TRADE_USD:.2f} USDT margin > free "
                       f"{free:.2f} USDT — skipping, not enough margin.")
+                self._log_trade_event({"event": "margin_insufficient", "symbol": symbol,
+                                       "allocated": config.RISK_PER_TRADE_USD, "free": free})
                 return 0.0
         except ratelimit.BinanceBanned:
             raise
         except Exception as e:
             print(f"  [trader] Could not check margin for {symbol}: {e}")
+            self._log_trade_event({"event": "margin_check_error", "symbol": symbol, "error": str(e)})
 
         try:
             precise_qty = float(self.exchange.amount_to_precision(symbol, qty))
@@ -300,12 +303,14 @@ class Trader:
                 f"  [trader] Aborting {levels.get('symbol', 'trade')} — signal deadline expired "
                 f"({time.time() - deadline_ts:.2f}s late)."
             )
+            self._log_trade_event({"event": "deadline_expired", "symbol": levels.get("symbol", ""), **levels})
             return None
 
         if self.has_open_position():
             print(f"  [trader] Skipping {levels['symbol']} — "
                   f"{self.open_position_count()} open + {self.pending_entry_count()} pending "
                   f"= {self.open_capacity_used()} slot(s) used, max {config.MAX_CONCURRENT_POSITIONS}.")
+            self._log_trade_event({"event": "capacity_full", "symbol": levels["symbol"], **levels})
             return None
 
         symbol = levels["symbol"]
@@ -329,6 +334,7 @@ class Trader:
             )
         if already_pending:
             print(f"  [trader] Skipping {symbol} — a LIMIT entry is already pending.")
+            self._log_trade_event({"event": "already_pending", "symbol": symbol, **levels})
             return None
 
         side = "buy" if direction == "long" else "sell"
@@ -336,17 +342,20 @@ class Trader:
         qty = self._position_size(symbol, entry_hint, sl)
         if qty <= 0:
             print(f"  [trader] Zero/invalid position size for {symbol}, skipping.")
+            self._log_trade_event({"event": "zero_position_size", "symbol": symbol, **levels})
             return None
 
         # 2. Re-check deadline right before API order placement
         if deadline_ts is not None and time.time() > deadline_ts:
             print(f"  [trader] Aborting {symbol} right before order placement — deadline exceeded.")
+            self._log_trade_event({"event": "deadline_expired", "symbol": symbol, **levels})
             return None
 
         try:
             self._guarded(self.exchange.set_leverage, config.LEVERAGE, symbol)
         except Exception as e:
             print(f"  [trader] Could not set leverage: {e}")
+            self._log_trade_event({"event": "leverage_set_failed", "symbol": symbol, "error": str(e)})
 
         # 3. LIMIT entry at the interest candle's exact close price — precise
         #    fill price, never a market order. The order waits at `entry` and
@@ -410,6 +419,8 @@ class Trader:
             # fill, attaches TP/SL, or cancels at deadline, all in background.
             print(f"  [trader] LIMIT {side.upper()} {symbol} qty={qty} @ {entry_price} placed — "
                   f"not waiting for fill, continuing pipeline.")
+            self._log_trade_event({"event": "order_placed", "symbol": symbol, "direction": direction,
+                                   "qty": qty, "entry": entry_price, "sl": sl, "tp": tp, "side": side})
             return entry_order
 
         rec["event"].wait(max(timeout_at - time.time(), 0.0))
@@ -587,10 +598,17 @@ class Trader:
                         rec["cancel_attempted"] = True
                         try:
                             self._guarded(self.exchange.cancel_order, rec["order_id"], rec["symbol"])
+                            self._log_trade_event({"event": "order_cancelled",
+                                                   "symbol": rec["symbol"],
+                                                   "order_id": rec["order_id"]})
                         except ratelimit.BinanceBanned:
                             continue
                         except Exception as e:
                             print(f"  [trader] Could not cancel unfilled LIMIT entry for {rec['symbol']}: {e}")
+                            self._log_trade_event({"event": "cancel_failed",
+                                                   "symbol": rec["symbol"],
+                                                   "order_id": rec["order_id"],
+                                                   "error": str(e)})
             except Exception as e:
                 print(f"  [trader] Cancel timer error: {e}")
             time.sleep(1)
