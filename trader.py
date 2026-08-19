@@ -661,6 +661,7 @@ class Trader:
             rec["resolved"] = True
             self._pending_entries.pop(rec["order_id"], None)
         self._open_trades[rec["symbol"]] = rec["meta"]
+        perfio.update_ledger(self.EXCHANGE_ID, self._open_trades)
         self._log_trade_event({"event": "opened", **rec["meta"]})
         print(f"  [trader] Opened {rec['direction'].upper()} {rec['symbol']} "
               f"qty={rec['qty']} entry={rec['entry_price']} (LIMIT filled) "
@@ -730,6 +731,10 @@ class Trader:
                 except ratelimit.BinanceBanned as e:
                     print(f"  [trader] IP banned by Binance ({e.remaining:.0f}s) — monitor paused, no polling.")
                     time.sleep(min(e.remaining, 60.0))
+                    continue
+                except (ccxt.RequestTimeout, ccxt.NetworkError) as e:
+                    print(f"  [trader] Network error polling positions: {e} — skipping poll cycle.")
+                    time.sleep(config.POSITION_POLL_SECONDS)
                     continue
 
                 account = self.fetch_account_state()

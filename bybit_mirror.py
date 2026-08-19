@@ -320,12 +320,16 @@ class BybitMirror:
                   f"signal deadline expired ({time.time() - deadline_ts:.2f}s late).")
             return None
 
+        symbol = levels["symbol"]
+        if not config.is_traded_symbol(symbol):
+            print(f"  [bybit] {symbol} not in traded-symbols allowlist — mirror skipped.")
+            return None
+
         if self.has_open_position():
             print(f"  [bybit] Skipping {levels['symbol']} — Bybit capacity full "
                   f"({self.open_capacity_used()}/{config.BYBIT_MAX_CONCURRENT_POSITIONS}).")
             return None
 
-        symbol = levels["symbol"]
         if not self._is_listed(symbol):
             print(f"  [bybit] {symbol} not listed on Bybit — mirror aborted, "
                   f"Binance side unaffected.")
@@ -583,6 +587,7 @@ class BybitMirror:
             rec["resolved"] = True
             self._pending_entries.pop(rec["order_id"], None)
         self._open_trades[rec["symbol"]] = rec["meta"]
+        perfio.update_ledger(self.EXCHANGE_ID, self._open_trades)
         self._log_trade_event({"event": "opened", **rec["meta"]})
         print(f"  [bybit] Opened {rec['direction'].upper()} {rec['symbol']} "
               f"qty={rec['qty']} entry={rec['entry_price']} sl={rec['sl']} "
@@ -622,7 +627,7 @@ class BybitMirror:
         gets a real close path instead of a forever-"open" ghost row."""
         meta = {
             "symbol": symbol,
-            "direction": "long" if str(side).lower() == "buy" or contracts > 0 else "short",
+            "direction": "long" if str(side).lower() == "buy" else "short",
             "qty": abs(contracts),
             "entry": float(pos.get("entryPrice") or 0),
             "sl": "",
