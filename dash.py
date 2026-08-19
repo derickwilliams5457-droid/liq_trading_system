@@ -300,6 +300,7 @@ class DataSource:
                     "exchange": ex, "symbol": t.get("symbol", sym),
                     "direction": t.get("direction", ""),
                     "qty": t.get("qty", ""), "entry": t.get("entry", ""),
+                    "sl": t.get("sl", ""), "tp": t.get("tp", ""),
                     "mark": t.get("mark", ""), "pnl": t.get("pnl", 0),
                     "opened_at": t.get("opened_at", ""),
                 })
@@ -777,9 +778,10 @@ function render(d){
 
   // Open positions
   const rows_o=(d.open||[]).map(t=>`<tr><td>${exlbl(t.exchange)}</td><td>${t.symbol}</td><td>${dirlbl(t.direction)}</td>
-    <td class="r">${fmt(t.qty,4)}</td><td class="r">${fmt(t.entry,6)}</td><td class="r">${fmt(t.mark,6)}</td>
+    <td class="r">${fmt(t.qty,4)}</td><td class="r">${fmt(t.entry,6)}</td><td class="r">${fmt(t.sl,6)}</td>
+    <td class="r">${fmt(t.tp,6)}</td><td class="r">${fmt(t.mark,6)}</td>
     <td class="r ${cls(t.pnl)}">${sym(t.pnl)}$${fmt(t.pnl,2)}</td></tr>`).join("");
-  E("open").innerHTML= d.open&&d.open.length?`<table><tr><th>Ex</th><th>Symbol</th><th>Dir</th><th class="r">Qty</th><th class="r">Entry</th><th class="r">Mark</th><th class="r">PnL</th></tr>${rows_o}</table>`:"<span class='muted'>none open</span>";
+  E("open").innerHTML= d.open&&d.open.length?`<table><tr><th>Ex</th><th>Symbol</th><th>Dir</th><th class="r">Qty</th><th class="r">Entry</th><th class="r">SL</th><th class="r">TP</th><th class="r">Mark</th><th class="r">PnL</th></tr>${rows_o}</table>`:"<span class='muted'>none open</span>";
 
   // Closed trades
   const rows_c=(d.closed||[]).slice(0,50).map(t=>`<tr><td>${exlbl(t.exchange)}</td><td>${t.symbol}</td><td>${dirlbl(t.direction)}</td>
