@@ -386,6 +386,21 @@ class BybitMirror:
             self._log_trade_event({"event": "order_failed", "error": str(e), **tlevels})
             return None
 
+        target_notional = config.BYBIT_RISK_PER_TRADE_USD * config.BYBIT_LEVERAGE
+        actual_notional = float(qty_precise) * tlevels["entry"]
+        if target_notional > 0 and actual_notional / target_notional < config.MIN_FILL_RATIO:
+            print(f"  [bybit] {symbol}: precision rounding collapsed notional from "
+                  f"${target_notional:.0f} to ${actual_notional:.2f} "
+                  f"({actual_notional/target_notional:.0%} of target) — mirror skipped, "
+                  f"position too small to be useful.")
+            self._log_trade_event({
+                "event": "skipped_small_notional", "symbol": symbol,
+                "target_notional": round(target_notional, 2),
+                "actual_notional": round(actual_notional, 2),
+                "qty_raw": round(qty, 8), "qty_precise": qty_precise,
+            })
+            return None
+
         # ── Place the LIMIT entry with native Bybit TP/SL. We pass the
         #    stopLoss/takeProfit OBJECT form ({triggerPrice}) so ccxt keeps
         #    the order on Bybit's place-order endpoint (privatePostV5OrderCreate)

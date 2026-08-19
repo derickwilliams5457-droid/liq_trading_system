@@ -206,6 +206,9 @@ MAX_CONCURRENT_POSITIONS = 3     # multiple positions open at a time (multi-coin
 # position behind the fill) and -4130 (the closePosition order already exists —
 # treated as already attached, not a failure).
 MAX_TP_SL_ATTACH_ATTEMPTS = 10
+# Skip trades where precision rounding reduced the position below 80% of target
+# notional (e.g. a $500 margin trade landing at $25 notional).
+MIN_FILL_RATIO = 0.80
 
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")

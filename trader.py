@@ -258,9 +258,26 @@ class Trader:
             print(f"  [trader] Could not check margin for {symbol}: {e}")
 
         try:
-            return float(self.exchange.amount_to_precision(symbol, qty))
+            precise_qty = float(self.exchange.amount_to_precision(symbol, qty))
         except Exception:
-            return qty
+            precise_qty = qty
+
+        target_notional = config.RISK_PER_TRADE_USD * config.LEVERAGE
+        actual_notional = precise_qty * entry
+        if target_notional > 0 and actual_notional / target_notional < config.MIN_FILL_RATIO:
+            print(f"  [trader] {symbol}: precision rounding collapsed notional from "
+                  f"${target_notional:.0f} to ${actual_notional:.2f} "
+                  f"({actual_notional/target_notional:.0%} of target) — skipping, "
+                  f"position too small to be useful.")
+            self._log_trade_event({
+                "event": "skipped_small_notional", "symbol": symbol,
+                "target_notional": round(target_notional, 2),
+                "actual_notional": round(actual_notional, 2),
+                "qty_raw": round(qty, 8), "qty_precise": precise_qty,
+            })
+            return 0.0
+
+        return precise_qty
 
     # ── Execution ────────────────────────────────────────────────────────
     def execute_trade(self, levels: dict, deadline_ts: float | None = None,
